@@ -14,15 +14,15 @@ a key pair to call [`CertificateParams::signed_by()`] or [`CertificateParams::se
 ## Example
 
 ```
-use rcgen::{generate_simple_self_signed, CertifiedKey};
+use rcgen::{generate_simple_self_signed, CertifiedKey, serialize_private_key_pem};
 # fn main () {
 // Generate a certificate that's valid for "localhost" and "hello.world.example"
 let subject_alt_names = vec!["hello.world.example".to_string(),
 	"localhost".to_string()];
 
-let CertifiedKey { cert, signing_key } = generate_simple_self_signed(subject_alt_names).unwrap();
+let (CertifiedKey { cert, signing_key }, private_key) = generate_simple_self_signed(subject_alt_names).unwrap();
 println!("{}", cert.pem());
-println!("{}", signing_key.serialize_pem());
+println!("{}", serialize_private_key_pem(&private_key).unwrap());
 # }
 ```"##
 )]
@@ -30,55 +30,65 @@ println!("{}", signing_key.serialize_pem());
 #![forbid(non_ascii_idents)]
 #![deny(missing_docs)]
 #![cfg_attr(rcgen_docsrs, feature(doc_cfg))]
-#![warn(unreachable_pub)]
+#![warn(unreachable_pub, clippy::exhaustive_enums, clippy::exhaustive_structs)]
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
-use std::net::IpAddr;
-#[cfg(feature = "x509-parser")]
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::Deref;
 
-pub use certificate::{
-	date_time_ymd, Attribute, BasicConstraints, Certificate, CertificateParams, CidrSubnet,
-	CustomExtension, DnType, ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, NameConstraints,
-};
+#[cfg(feature = "pem")]
+use pem::Pem;
+use pki_types::CertificateDer;
+#[cfg(feature = "crypto")]
+use pki_types::PrivateKeyDer;
+use time::{OffsetDateTime, Time};
+use yasna::models::{GeneralizedTime, UTCTime};
+use yasna::tags::{TAG_BMPSTRING, TAG_TELETEXSTRING, TAG_UNIVERSALSTRING};
+use yasna::DERWriter;
+
+mod certificate;
+pub use certificate::{date_time_ymd, Attribute, Certificate, CertificateParams, DnType};
+
+mod crl;
 pub use crl::{
-	CertificateRevocationList, CertificateRevocationListParams, CrlDistributionPoint,
-	CrlIssuingDistributionPoint, CrlScope, RevocationReason, RevokedCertParams,
+	CertificateRevocationList, CertificateRevocationListParams, CrlIssuingDistributionPoint,
+	CrlScope, RevocationReason, RevokedCertParams,
 };
+
+mod csr;
 pub use csr::{CertificateSigningRequest, CertificateSigningRequestParams, PublicKey};
+
+mod error;
 pub use error::{Error, InvalidAsn1String};
+
+mod extension;
+pub use extension::{
+	BasicConstraints, CidrSubnet, Criticality, CrlDistributionPoint, CustomExtension,
+	ExtendedKeyUsagePurpose, GeneralName, GeneralSubtree, KeyIdMethod, KeyUsagePurpose,
+	NameConstraints, OtherNameValue, PathLenConstraint,
+};
+
+mod key_pair;
+#[cfg(feature = "pem")]
+pub use key_pair::serialize_private_key_pem;
 #[cfg(feature = "crypto")]
 pub use key_pair::KeyPair;
 #[cfg(all(feature = "crypto", feature = "aws_lc_rs"))]
 pub use key_pair::RsaKeySize;
 pub use key_pair::{PublicKeyData, SigningKey, SubjectPublicKeyInfo};
-#[cfg(feature = "pem")]
-use pem::Pem;
-use pki_types::CertificateDer;
-#[cfg(feature = "crypto")]
-use ring_like::digest;
+
+mod sign_algo;
 pub use sign_algo::algo::*;
 pub use sign_algo::SignatureAlgorithm;
-use time::{OffsetDateTime, Time};
-use yasna::models::{GeneralizedTime, ObjectIdentifier, UTCTime};
-use yasna::tags::{TAG_BMPSTRING, TAG_TELETEXSTRING, TAG_UNIVERSALSTRING};
-use yasna::{DERWriter, Tag};
 
-use crate::string::{BmpString, Ia5String, PrintableString, TeletexString, UniversalString};
-
-mod certificate;
-mod crl;
-mod csr;
-mod error;
-mod key_pair;
 mod oid;
+
 mod ring_like;
-mod sign_algo;
+
 pub mod string;
+use string::{BmpString, Ia5String, PrintableString, TeletexString, UniversalString};
 
 /// Type-alias for the old name of [`Error`].
 #[deprecated(
@@ -87,6 +97,7 @@ pub mod string;
 pub type RcgenError = Error;
 
 /// An issued certificate, together with the subject keypair.
+#[allow(clippy::exhaustive_structs)]
 #[derive(PartialEq, Eq)]
 pub struct CertifiedKey<S: SigningKey> {
 	/// An issued certificate.
@@ -110,27 +121,27 @@ and key pair as output.
 ## Example
 
 ```
-use rcgen::{generate_simple_self_signed, CertifiedKey};
+use rcgen::{generate_simple_self_signed, CertifiedKey, serialize_private_key_pem};
 # fn main () {
 // Generate a certificate that's valid for "localhost" and "hello.world.example"
 let subject_alt_names = vec!["hello.world.example".to_string(),
 	"localhost".to_string()];
 
-let CertifiedKey { cert, signing_key } = generate_simple_self_signed(subject_alt_names).unwrap();
+let (CertifiedKey { cert, signing_key }, private_key) = generate_simple_self_signed(subject_alt_names).unwrap();
 
 // The certificate is now valid for localhost and the domain "hello.world.example"
 println!("{}", cert.pem());
-println!("{}", signing_key.serialize_pem());
+println!("{}", serialize_private_key_pem(&private_key).unwrap());
 # }
 ```
 "##
 )]
 pub fn generate_simple_self_signed(
 	subject_alt_names: impl Into<Vec<String>>,
-) -> Result<CertifiedKey<KeyPair>, Error> {
-	let signing_key = KeyPair::generate()?;
+) -> Result<(CertifiedKey<KeyPair>, PrivateKeyDer<'static>), Error> {
+	let (signing_key, private_key) = KeyPair::generate()?;
 	let cert = CertificateParams::new(subject_alt_names)?.self_signed(&signing_key)?;
-	Ok(CertifiedKey { cert, signing_key })
+	Ok((CertifiedKey { cert, signing_key }, private_key))
 }
 
 /// An [`Issuer`] wrapper that also contains the issuer's [`Certificate`].
@@ -301,136 +312,6 @@ const ENCODE_CONFIG: pem::EncodeConfig = {
 	pem::EncodeConfig::new().set_line_ending(line_ending)
 };
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-#[allow(missing_docs)]
-#[non_exhaustive]
-/// The type of subject alt name
-pub enum SanType {
-	/// Also known as E-Mail address
-	Rfc822Name(Ia5String),
-	DnsName(Ia5String),
-	URI(Ia5String),
-	IpAddress(IpAddr),
-	OtherName((Vec<u64>, OtherNameValue)),
-}
-
-impl SanType {
-	#[cfg(all(test, feature = "x509-parser"))]
-	fn from_x509(x509: &x509_parser::certificate::X509Certificate<'_>) -> Result<Vec<Self>, Error> {
-		let sans = x509
-			.subject_alternative_name()
-			.map_err(|_| Error::CouldNotParseCertificate)?
-			.map(|ext| &ext.value.general_names);
-
-		let Some(sans) = sans else {
-			return Ok(Vec::new());
-		};
-
-		let mut subject_alt_names = Vec::with_capacity(sans.len());
-		for san in sans {
-			subject_alt_names.push(Self::try_from_general(san)?);
-		}
-		Ok(subject_alt_names)
-	}
-}
-
-/// An `OtherName` value, defined in [RFC 5280§4.1.2.4].
-///
-/// While the standard specifies this could be any ASN.1 type rcgen limits
-/// the value to a UTF-8 encoded string as this will cover the most common
-/// use cases, for instance smart card user principal names (UPN).
-///
-/// [RFC 5280§4.1.2.4]: https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.2.4
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-#[non_exhaustive]
-pub enum OtherNameValue {
-	/// A string encoded using UTF-8
-	Utf8String(String),
-}
-
-impl OtherNameValue {
-	fn write_der(&self, writer: DERWriter) {
-		writer.write_tagged(Tag::context(0), |writer| match self {
-			OtherNameValue::Utf8String(s) => writer.write_utf8_string(s),
-		});
-	}
-}
-
-impl<T> From<T> for OtherNameValue
-where
-	T: Into<String>,
-{
-	fn from(t: T) -> Self {
-		OtherNameValue::Utf8String(t.into())
-	}
-}
-
-#[cfg(feature = "x509-parser")]
-fn ip_addr_from_octets(octets: &[u8]) -> Result<IpAddr, Error> {
-	if let Ok(ipv6_octets) = <&[u8; 16]>::try_from(octets) {
-		Ok(Ipv6Addr::from(*ipv6_octets).into())
-	} else if let Ok(ipv4_octets) = <&[u8; 4]>::try_from(octets) {
-		Ok(Ipv4Addr::from(*ipv4_octets).into())
-	} else {
-		Err(Error::InvalidIpAddressOctetLength(octets.len()))
-	}
-}
-
-impl SanType {
-	#[cfg(feature = "x509-parser")]
-	fn try_from_general(name: &x509_parser::extensions::GeneralName<'_>) -> Result<Self, Error> {
-		use x509_parser::der_parser::asn1_rs::{self, FromDer, Tag, TaggedExplicit};
-		Ok(match name {
-			x509_parser::extensions::GeneralName::RFC822Name(name) => {
-				SanType::Rfc822Name((*name).try_into()?)
-			},
-			x509_parser::extensions::GeneralName::DNSName(name) => {
-				SanType::DnsName((*name).try_into()?)
-			},
-			x509_parser::extensions::GeneralName::URI(name) => SanType::URI((*name).try_into()?),
-			x509_parser::extensions::GeneralName::IPAddress(octets) => {
-				SanType::IpAddress(ip_addr_from_octets(octets)?)
-			},
-			x509_parser::extensions::GeneralName::OtherName(oid, value) => {
-				let oid = oid.iter().ok_or(Error::CouldNotParseCertificate)?;
-				// We first remove the explicit tag ([0] EXPLICIT)
-				let (_, other_name) = TaggedExplicit::<asn1_rs::Any, _, 0>::from_der(value)
-					.map_err(|_| Error::CouldNotParseCertificate)?;
-				let other_name = other_name.into_inner();
-
-				let other_name_value = match other_name.tag() {
-					Tag::Utf8String => OtherNameValue::Utf8String(
-						std::str::from_utf8(other_name.data)
-							.map_err(|_| Error::CouldNotParseCertificate)?
-							.to_owned(),
-					),
-					_ => return Err(Error::CouldNotParseCertificate),
-				};
-				SanType::OtherName((oid.collect(), other_name_value))
-			},
-			_ => return Err(Error::InvalidNameType),
-		})
-	}
-
-	fn tag(&self) -> u64 {
-		// Defined in the GeneralName list in
-		// https://tools.ietf.org/html/rfc5280#page-38
-		const TAG_OTHER_NAME: u64 = 0;
-		const TAG_RFC822_NAME: u64 = 1;
-		const TAG_DNS_NAME: u64 = 2;
-		const TAG_URI: u64 = 6;
-		const TAG_IP_ADDRESS: u64 = 7;
-
-		match self {
-			SanType::Rfc822Name(_name) => TAG_RFC822_NAME,
-			SanType::DnsName(_name) => TAG_DNS_NAME,
-			SanType::URI(_name) => TAG_URI,
-			SanType::IpAddress(_addr) => TAG_IP_ADDRESS,
-			Self::OtherName(_oid) => TAG_OTHER_NAME,
-		}
-	}
-}
-
 /// A distinguished name entry
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 #[non_exhaustive]
@@ -583,162 +464,6 @@ impl<'a> Iterator for DistinguishedNameIterator<'a> {
 	}
 }
 
-/// One of the purposes contained in the [key usage](https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.3) extension
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub enum KeyUsagePurpose {
-	/// digitalSignature
-	DigitalSignature,
-	/// contentCommitment / nonRepudiation
-	ContentCommitment,
-	/// keyEncipherment
-	KeyEncipherment,
-	/// dataEncipherment
-	DataEncipherment,
-	/// keyAgreement
-	KeyAgreement,
-	/// keyCertSign
-	KeyCertSign,
-	/// cRLSign
-	CrlSign,
-	/// encipherOnly
-	EncipherOnly,
-	/// decipherOnly
-	DecipherOnly,
-}
-
-impl KeyUsagePurpose {
-	#[cfg(feature = "x509-parser")]
-	fn from_x509(x509: &x509_parser::certificate::X509Certificate<'_>) -> Result<Vec<Self>, Error> {
-		let key_usage = x509
-			.key_usage()
-			.map_err(|_| Error::CouldNotParseCertificate)?
-			.map(|ext| ext.value);
-		// This x509 parser stores flags in reversed bit BIT STRING order
-		let flags = key_usage.map_or(0u16, |k| k.flags).reverse_bits();
-		Ok(Self::from_u16(flags))
-	}
-
-	/// Encode a key usage as the value of a BIT STRING as defined by RFC 5280.
-	/// [`u16`] is sufficient to encode the largest possible key usage value (two bytes).
-	fn to_u16(self) -> u16 {
-		const FLAG: u16 = 0b1000_0000_0000_0000;
-		FLAG >> match self {
-			KeyUsagePurpose::DigitalSignature => 0,
-			KeyUsagePurpose::ContentCommitment => 1,
-			KeyUsagePurpose::KeyEncipherment => 2,
-			KeyUsagePurpose::DataEncipherment => 3,
-			KeyUsagePurpose::KeyAgreement => 4,
-			KeyUsagePurpose::KeyCertSign => 5,
-			KeyUsagePurpose::CrlSign => 6,
-			KeyUsagePurpose::EncipherOnly => 7,
-			KeyUsagePurpose::DecipherOnly => 8,
-		}
-	}
-
-	/// Parse a collection of key usages from a [`u16`] representing the value
-	/// of a KeyUsage BIT STRING as defined by RFC 5280.
-	#[cfg(feature = "x509-parser")]
-	fn from_u16(value: u16) -> Vec<Self> {
-		[
-			KeyUsagePurpose::DigitalSignature,
-			KeyUsagePurpose::ContentCommitment,
-			KeyUsagePurpose::KeyEncipherment,
-			KeyUsagePurpose::DataEncipherment,
-			KeyUsagePurpose::KeyAgreement,
-			KeyUsagePurpose::KeyCertSign,
-			KeyUsagePurpose::CrlSign,
-			KeyUsagePurpose::EncipherOnly,
-			KeyUsagePurpose::DecipherOnly,
-		]
-		.iter()
-		.filter_map(|key_usage| {
-			let present = key_usage.to_u16() & value != 0;
-			present.then_some(*key_usage)
-		})
-		.collect()
-	}
-}
-
-/// Method to generate key identifiers from public keys.
-///
-/// Key identifiers should be derived from the public key data. [RFC 7093] defines
-/// three methods to do so using a choice of SHA256 (method 1), SHA384 (method 2), or SHA512
-/// (method 3). In each case the first 160 bits of the hash are used as the key identifier
-/// to match the output length that would be produced were SHA1 used (a legacy option defined
-/// in RFC 5280).
-///
-/// In addition to the RFC 7093 mechanisms, rcgen supports using a pre-specified key identifier.
-/// This can be helpful when working with an existing `Certificate`.
-///
-/// [RFC 7093]: https://www.rfc-editor.org/rfc/rfc7093
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-#[non_exhaustive]
-pub enum KeyIdMethod {
-	/// RFC 7093 method 1 - a truncated SHA256 digest.
-	#[cfg(feature = "crypto")]
-	Sha256,
-	/// RFC 7093 method 2 - a truncated SHA384 digest.
-	#[cfg(feature = "crypto")]
-	Sha384,
-	/// RFC 7093 method 3 - a truncated SHA512 digest.
-	#[cfg(feature = "crypto")]
-	Sha512,
-	/// Pre-specified identifier. The exact given value is used as the key identifier.
-	PreSpecified(Vec<u8>),
-}
-
-impl KeyIdMethod {
-	#[cfg(feature = "x509-parser")]
-	fn from_x509(x509: &x509_parser::certificate::X509Certificate<'_>) -> Result<Self, Error> {
-		let key_identifier_method =
-			x509.iter_extensions()
-				.find_map(|ext| match ext.parsed_extension() {
-					x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(key_id) => {
-						Some(KeyIdMethod::PreSpecified(key_id.0.into()))
-					},
-					_ => None,
-				});
-
-		Ok(match key_identifier_method {
-			Some(method) => method,
-			None => {
-				#[cfg(not(feature = "crypto"))]
-				return Err(Error::UnsupportedSignatureAlgorithm);
-				#[cfg(feature = "crypto")]
-				KeyIdMethod::Sha256
-			},
-		})
-	}
-
-	/// Derive a key identifier for the provided subject public key info using the key ID method.
-	///
-	/// Typically this is a truncated hash over the raw subject public key info, but may
-	/// be a pre-specified value.
-	///
-	/// This key identifier is used in the SubjectKeyIdentifier and AuthorityKeyIdentifier
-	/// X.509v3 extensions.
-	#[allow(unused_variables)]
-	pub(crate) fn derive(&self, subject_public_key_info: impl AsRef<[u8]>) -> Vec<u8> {
-		#[cfg_attr(not(feature = "crypto"), expect(clippy::let_unit_value))]
-		let digest_method = match &self {
-			#[cfg(feature = "crypto")]
-			Self::Sha256 => &digest::SHA256,
-			#[cfg(feature = "crypto")]
-			Self::Sha384 => &digest::SHA384,
-			#[cfg(feature = "crypto")]
-			Self::Sha512 => &digest::SHA512,
-			Self::PreSpecified(b) => {
-				return b.to_vec();
-			},
-		};
-		#[cfg(feature = "crypto")]
-		{
-			let digest = digest::digest(digest_method, subject_public_key_info.as_ref());
-			digest.as_ref()[0..20].to_vec()
-		}
-	}
-}
-
 fn dt_strip_nanos(dt: OffsetDateTime) -> OffsetDateTime {
 	// Set nanoseconds to zero
 	// This is needed because the GeneralizedTime serializer would otherwise
@@ -808,62 +533,6 @@ fn write_distinguished_name(writer: DERWriter, dn: &DistinguishedName) {
 			});
 		}
 	});
-}
-
-/// Serializes an X.509v3 extension according to RFC 5280
-fn write_x509_extension(
-	writer: DERWriter,
-	extension_oid: &[u64],
-	is_critical: bool,
-	value_serializer: impl FnOnce(DERWriter),
-) {
-	// Extension specification:
-	//    Extension  ::=  SEQUENCE  {
-	//         extnID      OBJECT IDENTIFIER,
-	//         critical    BOOLEAN DEFAULT FALSE,
-	//         extnValue   OCTET STRING
-	//                     -- contains the DER encoding of an ASN.1 value
-	//                     -- corresponding to the extension type identified
-	//                     -- by extnID
-	//         }
-
-	writer.write_sequence(|writer| {
-		let oid = ObjectIdentifier::from_slice(extension_oid);
-		writer.next().write_oid(&oid);
-		if is_critical {
-			writer.next().write_bool(true);
-		}
-		let bytes = yasna::construct_der(value_serializer);
-		writer.next().write_bytes(&bytes);
-	})
-}
-
-/// Serializes an X.509v3 authority key identifier extension according to RFC 5280.
-fn write_x509_authority_key_identifier(writer: DERWriter, aki: Vec<u8>) {
-	// Write Authority Key Identifier
-	// RFC 5280 states:
-	//   'The keyIdentifier field of the authorityKeyIdentifier extension MUST
-	//    be included in all certificates generated by conforming CAs to
-	//    facilitate certification path construction.  There is one exception;
-	//    where a CA distributes its public key in the form of a "self-signed"
-	//    certificate, the authority key identifier MAY be omitted.'
-	// In addition, for CRLs:
-	//    'Conforming CRL issuers MUST use the key identifier method, and MUST
-	//     include this extension in all CRLs issued.'
-	write_x509_extension(writer, oid::AUTHORITY_KEY_IDENTIFIER, false, |writer| {
-		writer.write_sequence(|writer| {
-			writer
-				.next()
-				.write_tagged_implicit(Tag::context(0), |writer| writer.write_bytes(&aki))
-		});
-	});
-}
-
-#[cfg(feature = "zeroize")]
-impl zeroize::Zeroize for KeyPair {
-	fn zeroize(&mut self) {
-		self.serialized_der.zeroize();
-	}
 }
 
 /// A certificate serial number.
@@ -978,72 +647,6 @@ mod tests {
 					"Algorithm relationship mismatch for algorithm index pair {i} and {j}"
 				);
 			}
-		}
-	}
-
-	#[cfg(feature = "x509-parser")]
-	mod test_ip_address_from_octets {
-		use std::net::IpAddr;
-
-		use super::super::{ip_addr_from_octets, Error};
-
-		#[test]
-		fn ipv4() {
-			let octets = [10, 20, 30, 40];
-
-			let actual = ip_addr_from_octets(&octets).unwrap();
-
-			assert_eq!(IpAddr::from(octets), actual)
-		}
-
-		#[test]
-		fn ipv6() {
-			let octets = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-
-			let actual = ip_addr_from_octets(&octets).unwrap();
-
-			assert_eq!(IpAddr::from(octets), actual)
-		}
-
-		#[test]
-		fn mismatch() {
-			let incorrect = Vec::from_iter(0..10);
-			let actual = ip_addr_from_octets(&incorrect).unwrap_err();
-
-			assert_eq!(Error::InvalidIpAddressOctetLength(10), actual);
-		}
-
-		#[test]
-		fn none() {
-			let actual = ip_addr_from_octets(&[]).unwrap_err();
-
-			assert_eq!(Error::InvalidIpAddressOctetLength(0), actual);
-		}
-
-		#[test]
-		fn too_many() {
-			let incorrect = Vec::from_iter(0..20);
-			let actual = ip_addr_from_octets(&incorrect).unwrap_err();
-
-			assert_eq!(Error::InvalidIpAddressOctetLength(20), actual);
-		}
-	}
-
-	#[cfg(feature = "x509-parser")]
-	mod test_san_type_from_general_name {
-		use std::net::IpAddr;
-
-		use x509_parser::extensions::GeneralName;
-
-		use crate::SanType;
-
-		#[test]
-		fn with_ipv4() {
-			let octets = [1, 2, 3, 4];
-			let value = GeneralName::IPAddress(&octets);
-			let actual = SanType::try_from_general(&value).unwrap();
-
-			assert_eq!(SanType::IpAddress(IpAddr::from(octets)), actual);
 		}
 	}
 }

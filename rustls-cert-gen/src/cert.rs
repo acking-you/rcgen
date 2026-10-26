@@ -4,10 +4,12 @@ use std::str::FromStr;
 use std::{fmt, io};
 
 use bpaf::Bpaf;
+use pki_types::PrivateKeyDer;
 use rcgen::DnValue::PrintableString;
 use rcgen::{
-	BasicConstraints, Certificate, CertificateParams, CertifiedIssuer, DistinguishedName, DnType,
-	ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType, SignatureAlgorithm,
+	serialize_private_key_pem, BasicConstraints, Certificate, CertificateParams, CertifiedIssuer,
+	DistinguishedName, DnType, Error, ExtendedKeyUsagePurpose, GeneralName, KeyPair,
+	KeyUsagePurpose, PathLenConstraint, SignatureAlgorithm,
 };
 
 /// Builder to configure TLS [CertificateParams] to be finalized
@@ -64,7 +66,7 @@ pub struct CaBuilder {
 impl CaBuilder {
 	/// Initialize `CaBuilder`
 	pub fn new(mut params: CertificateParams, alg: KeyPairAlgorithm) -> Self {
-		params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+		params.basic_constraints = Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained));
 		params.key_usages.push(KeyUsagePurpose::DigitalSignature);
 		params.key_usages.push(KeyUsagePurpose::KeyCertSign);
 		params.key_usages.push(KeyUsagePurpose::CrlSign);
@@ -88,9 +90,10 @@ impl CaBuilder {
 	}
 	/// build `Ca` Certificate.
 	pub fn build(self) -> Result<Ca, rcgen::Error> {
-		let key_pair = KeyPair::generate_for(self.alg.into())?;
+		let (key_pair, key_der) = KeyPair::generate_for(self.alg.into())?;
 		Ok(Ca {
 			issuer: CertifiedIssuer::self_signed(self.params, key_pair)?,
+			key_der,
 		})
 	}
 }
@@ -99,16 +102,18 @@ impl CaBuilder {
 #[derive(Debug)]
 pub struct Ca {
 	issuer: CertifiedIssuer<'static, KeyPair>,
+	key_der: PrivateKeyDer<'static>,
 }
 
 impl Ca {
 	/// Self-sign and serialize
-	pub fn serialize_pem(&self) -> PemCertifiedKey {
-		PemCertifiedKey {
+	pub fn serialize_pem(&self) -> Result<PemCertifiedKey, Error> {
+		Ok(PemCertifiedKey {
 			cert_pem: self.issuer.pem(),
-			private_key_pem: self.issuer.key().serialize_pem(),
-		}
+			private_key_pem: serialize_private_key_pem(&self.key_der)?,
+		})
 	}
+
 	/// Return `&Certificate`
 	#[allow(dead_code)]
 	pub fn cert(&self) -> &Certificate {
@@ -120,16 +125,16 @@ impl Ca {
 #[derive(Debug)]
 pub struct EndEntity {
 	cert: Certificate,
-	key_pair: KeyPair,
+	key_der: PrivateKeyDer<'static>,
 }
 
 impl EndEntity {
 	/// Sign with `signer` and serialize.
-	pub fn serialize_pem(&self) -> PemCertifiedKey {
-		PemCertifiedKey {
+	pub fn serialize_pem(&self) -> Result<PemCertifiedKey, Error> {
+		Ok(PemCertifiedKey {
 			cert_pem: self.cert.pem(),
-			private_key_pem: self.key_pair.serialize_pem(),
-		}
+			private_key_pem: serialize_private_key_pem(&self.key_der)?,
+		})
 	}
 }
 
@@ -143,7 +148,7 @@ pub struct EndEntityBuilder {
 impl EndEntityBuilder {
 	/// Initialize `EndEntityBuilder`
 	pub fn new(mut params: CertificateParams, alg: KeyPairAlgorithm) -> Self {
-		params.is_ca = IsCa::NoCa;
+		params.basic_constraints = None;
 		params.use_authority_key_identifier_extension = true;
 		params.key_usages.push(KeyUsagePurpose::DigitalSignature);
 		Self { params, alg }
@@ -156,10 +161,10 @@ impl EndEntityBuilder {
 			.push(DnType::CommonName, name);
 		self
 	}
-	/// `SanTypes` that will be recorded as
+	/// [`GeneralName`]s that will be recorded as
 	/// `subject_alt_names`. Multiple calls will append to previous
 	/// values.
-	pub fn subject_alternative_names(mut self, sans: Vec<SanType>) -> Self {
+	pub fn subject_alternative_names(mut self, sans: Vec<GeneralName>) -> Self {
 		self.params.subject_alt_names.extend(sans);
 		self
 	}
@@ -181,9 +186,9 @@ impl EndEntityBuilder {
 	}
 	/// build `EndEntity` Certificate.
 	pub fn build(self, issuer: &Ca) -> Result<EndEntity, rcgen::Error> {
-		let key_pair = KeyPair::generate_for(self.alg.into())?;
+		let (key_pair, key_der) = KeyPair::generate_for(self.alg.into())?;
 		let cert = self.params.signed_by(&key_pair, &issuer.issuer)?;
-		Ok(EndEntity { cert, key_pair })
+		Ok(EndEntity { cert, key_der })
 	}
 }
 
@@ -208,18 +213,18 @@ pub enum KeyPairAlgorithm {
 impl From<KeyPairAlgorithm> for &'static SignatureAlgorithm {
 	fn from(alg: KeyPairAlgorithm) -> Self {
 		match alg {
-			KeyPairAlgorithm::Rsa => &rcgen::PKCS_RSA_SHA256,
-			KeyPairAlgorithm::Ed25519 => &rcgen::PKCS_ED25519,
-			KeyPairAlgorithm::EcdsaP256 => &rcgen::PKCS_ECDSA_P256_SHA256,
-			KeyPairAlgorithm::EcdsaP384 => &rcgen::PKCS_ECDSA_P384_SHA384,
+			KeyPairAlgorithm::Rsa => &rcgen::RSA_PKCS1_SHA256,
+			KeyPairAlgorithm::Ed25519 => &rcgen::ED25519,
+			KeyPairAlgorithm::EcdsaP256 => &rcgen::ECDSA_P256_SHA256,
+			KeyPairAlgorithm::EcdsaP384 => &rcgen::ECDSA_P384_SHA384,
 			#[cfg(feature = "aws_lc_rs")]
-			KeyPairAlgorithm::EcdsaP521 => &rcgen::PKCS_ECDSA_P521_SHA512,
+			KeyPairAlgorithm::EcdsaP521 => &rcgen::ECDSA_P521_SHA512,
 			#[cfg(feature = "aws_lc_rs")]
-			KeyPairAlgorithm::MlDsa44 => &rcgen::PKCS_ML_DSA_44,
+			KeyPairAlgorithm::MlDsa44 => &rcgen::ML_DSA_44,
 			#[cfg(feature = "aws_lc_rs")]
-			KeyPairAlgorithm::MlDsa65 => &rcgen::PKCS_ML_DSA_65,
+			KeyPairAlgorithm::MlDsa65 => &rcgen::ML_DSA_65,
 			#[cfg(feature = "aws_lc_rs")]
-			KeyPairAlgorithm::MlDsa87 => &rcgen::PKCS_ML_DSA_87,
+			KeyPairAlgorithm::MlDsa87 => &rcgen::ML_DSA_87,
 		}
 	}
 }
@@ -319,7 +324,10 @@ mod tests {
 	#[test]
 	fn init_ca() {
 		let cert = CertificateBuilder::new().certificate_authority();
-		assert_eq!(cert.params.is_ca, IsCa::Ca(BasicConstraints::Unconstrained))
+		assert_eq!(
+			cert.params.basic_constraints,
+			Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained))
+		)
 	}
 	#[test]
 	fn with_sig_algo_default() -> anyhow::Result<()> {
@@ -334,12 +342,12 @@ mod tests {
 		let end_entity = CertificateBuilder::new()
 			.end_entity()
 			.build(&ca)?
-			.serialize_pem();
+			.serialize_pem()?;
 
 		let der = pem::parse(end_entity.cert_pem)?;
 		let (_, cert) = X509Certificate::from_der(der.contents())?;
 
-		let issuer_der = pem::parse(ca.serialize_pem().cert_pem)?;
+		let issuer_der = pem::parse(ca.serialize_pem()?.cert_pem)?;
 		let (_, issuer) = X509Certificate::from_der(issuer_der.contents())?;
 
 		assert!(!cert.is_ca());
@@ -354,12 +362,12 @@ mod tests {
 			.signature_algorithm(KeyPairAlgorithm::EcdsaP384)?
 			.end_entity()
 			.build(&ca)?
-			.serialize_pem();
+			.serialize_pem()?;
 
 		let der = pem::parse(end_entity.cert_pem)?;
 		let (_, cert) = X509Certificate::from_der(der.contents())?;
 
-		let issuer_der = pem::parse(ca.serialize_pem().cert_pem)?;
+		let issuer_der = pem::parse(ca.serialize_pem()?.cert_pem)?;
 		let (_, issuer) = X509Certificate::from_der(issuer_der.contents())?;
 
 		check_signature(&cert, &issuer);
@@ -374,12 +382,12 @@ mod tests {
 			.signature_algorithm(KeyPairAlgorithm::EcdsaP521)?
 			.end_entity()
 			.build(&ca)?
-			.serialize_pem();
+			.serialize_pem()?;
 
 		let der = pem::parse(end_entity.cert_pem)?;
 		let (_, cert) = X509Certificate::from_der(der.contents())?;
 
-		let issuer_der = pem::parse(ca.serialize_pem().cert_pem)?;
+		let issuer_der = pem::parse(ca.serialize_pem()?.cert_pem)?;
 		let (_, issuer) = X509Certificate::from_der(issuer_der.contents())?;
 
 		check_signature(&cert, &issuer);
@@ -393,12 +401,12 @@ mod tests {
 			.signature_algorithm(KeyPairAlgorithm::Ed25519)?
 			.end_entity()
 			.build(&ca)?
-			.serialize_pem();
+			.serialize_pem()?;
 
 		let der = pem::parse(end_entity.cert_pem)?;
 		let (_, cert) = X509Certificate::from_der(der.contents())?;
 
-		let issuer_der = pem::parse(ca.serialize_pem().cert_pem)?;
+		let issuer_der = pem::parse(ca.serialize_pem()?.cert_pem)?;
 		let (_, issuer) = X509Certificate::from_der(issuer_der.contents())?;
 
 		check_signature(&cert, &issuer);
@@ -414,7 +422,7 @@ mod tests {
 	fn init_end_endity() {
 		let params = CertificateParams::default();
 		let cert = EndEntityBuilder::new(params, KeyPairAlgorithm::default());
-		assert_eq!(cert.params.is_ca, IsCa::NoCa)
+		assert_eq!(cert.params.basic_constraints, None)
 	}
 	#[test]
 	fn client_auth_end_entity() {
@@ -424,7 +432,7 @@ mod tests {
 			.unwrap();
 		let params = CertificateParams::default();
 		let mut cert = EndEntityBuilder::new(params, KeyPairAlgorithm::default());
-		assert_eq!(cert.params.is_ca, IsCa::NoCa);
+		assert_eq!(cert.params.basic_constraints, None);
 		assert_eq!(
 			cert.client_auth().params.extended_key_usages,
 			vec![ExtendedKeyUsagePurpose::ClientAuth]
@@ -438,7 +446,7 @@ mod tests {
 			.unwrap();
 		let params = CertificateParams::default();
 		let mut cert = EndEntityBuilder::new(params, KeyPairAlgorithm::default());
-		assert_eq!(cert.params.is_ca, IsCa::NoCa);
+		assert_eq!(cert.params.basic_constraints, None);
 		assert_eq!(
 			cert.server_auth().params.extended_key_usages,
 			vec![ExtendedKeyUsagePurpose::ServerAuth]
@@ -451,13 +459,13 @@ mod tests {
 			.build()
 			.unwrap();
 		let name = "unexpected.oomyoo.xyz";
-		let names = vec![SanType::DnsName(name.try_into().unwrap())];
+		let names = vec![GeneralName::DnsName(name.try_into().unwrap())];
 		let params = CertificateParams::default();
 		let cert = EndEntityBuilder::new(params, KeyPairAlgorithm::default())
 			.subject_alternative_names(names);
 		assert_eq!(
 			cert.params.subject_alt_names,
-			vec![rcgen::SanType::DnsName(name.try_into().unwrap())]
+			vec![rcgen::GeneralName::DnsName(name.try_into().unwrap())]
 		);
 	}
 	#[test]
@@ -475,27 +483,21 @@ mod tests {
 
 	#[test]
 	fn key_pair_algorithm_to_keypair() -> anyhow::Result<()> {
-		let keypair = KeyPair::generate_for(KeyPairAlgorithm::Ed25519.into())?;
-		assert_eq!(format!("{:?}", keypair.algorithm()), "PKCS_ED25519");
-		let keypair = KeyPair::generate_for(KeyPairAlgorithm::EcdsaP256.into())?;
-		assert_eq!(
-			format!("{:?}", keypair.algorithm()),
-			"PKCS_ECDSA_P256_SHA256"
-		);
-		let keypair = KeyPair::generate_for(KeyPairAlgorithm::EcdsaP384.into())?;
-		assert_eq!(
-			format!("{:?}", keypair.algorithm()),
-			"PKCS_ECDSA_P384_SHA384"
-		);
+		let (keypair, _) = KeyPair::generate_for(KeyPairAlgorithm::Ed25519.into())?;
+		assert_eq!(format!("{:?}", keypair.algorithm()), "ED25519");
+
+		let (keypair, _) = KeyPair::generate_for(KeyPairAlgorithm::EcdsaP256.into())?;
+		assert_eq!(format!("{:?}", keypair.algorithm()), "ECDSA_P256_SHA256");
+
+		let (keypair, _) = KeyPair::generate_for(KeyPairAlgorithm::EcdsaP384.into())?;
+		assert_eq!(format!("{:?}", keypair.algorithm()), "ECDSA_P384_SHA384");
 
 		#[cfg(feature = "aws_lc_rs")]
 		{
-			let keypair = KeyPair::generate_for(KeyPairAlgorithm::EcdsaP521.into())?;
-			assert_eq!(
-				format!("{:?}", keypair.algorithm()),
-				"PKCS_ECDSA_P521_SHA512"
-			);
+			let (keypair, _) = KeyPair::generate_for(KeyPairAlgorithm::EcdsaP521.into())?;
+			assert_eq!(format!("{:?}", keypair.algorithm()), "ECDSA_P521_SHA512");
 		}
+
 		Ok(())
 	}
 }

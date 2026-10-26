@@ -2,14 +2,14 @@
 
 use rcgen::{
 	BasicConstraints, Certificate, CertificateParams, CertificateRevocationListParams, DnType,
-	DnValue, IsCa, Issuer, KeyPair, KeyUsagePurpose, RevocationReason, RevokedCertParams,
-	SerialNumber,
+	DnValue, Issuer, KeyPair, KeyUsagePurpose, PathLenConstraint, RevocationReason,
+	RevokedCertParams, SerialNumber,
 };
 use time::{Duration, OffsetDateTime};
 use verify_tests as util;
 
 fn default_params() -> (CertificateParams, KeyPair) {
-	let (mut params, key_pair) = util::default_params();
+	let (mut params, key_pair, _) = util::default_params();
 	// Botan has a sanity check that enforces a maximum expiration date
 	params.not_after = rcgen::date_time_ymd(3016, 1, 1);
 	(params, key_pair)
@@ -57,7 +57,7 @@ fn test_botan() {
 #[test]
 fn test_botan_256() {
 	let (params, _) = default_params();
-	let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+	let (key_pair, _) = KeyPair::generate_for(&rcgen::ECDSA_P256_SHA256).unwrap();
 	let cert = params.self_signed(&key_pair).unwrap();
 
 	// Now verify the certificate.
@@ -67,7 +67,7 @@ fn test_botan_256() {
 #[test]
 fn test_botan_384() {
 	let (params, _) = default_params();
-	let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+	let (key_pair, _) = KeyPair::generate_for(&rcgen::ECDSA_P384_SHA384).unwrap();
 	let cert = params.self_signed(&key_pair).unwrap();
 
 	// Now verify the certificate.
@@ -78,7 +78,7 @@ fn test_botan_384() {
 #[cfg(feature = "aws_lc_rs")]
 fn test_botan_521() {
 	let (params, _) = default_params();
-	let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P521_SHA512).unwrap();
+	let (key_pair, _) = KeyPair::generate_for(&rcgen::ECDSA_P521_SHA512).unwrap();
 	let cert = params.self_signed(&key_pair).unwrap();
 
 	// Now verify the certificate.
@@ -88,7 +88,7 @@ fn test_botan_521() {
 #[test]
 fn test_botan_25519() {
 	let (params, _) = default_params();
-	let key_pair = KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+	let (key_pair, _) = KeyPair::generate_for(&rcgen::ED25519).unwrap();
 	let cert = params.self_signed(&key_pair).unwrap();
 
 	// Now verify the certificate.
@@ -128,7 +128,7 @@ fn test_botan_rsa_given() {
 #[test]
 fn test_botan_separate_ca() {
 	let (mut ca_params, ca_key) = default_params();
-	ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+	ca_params.basic_constraints = Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained));
 	let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
 	let mut params = CertificateParams::new(vec!["crabs.crabs".to_string()]).unwrap();
@@ -141,7 +141,7 @@ fn test_botan_separate_ca() {
 	// Botan has a sanity check that enforces a maximum expiration date
 	params.not_after = rcgen::date_time_ymd(3016, 1, 1);
 
-	let key_pair = KeyPair::generate().unwrap();
+	let (key_pair, _) = KeyPair::generate().unwrap();
 	let ca = Issuer::new(ca_params, ca_key);
 	let cert = params.signed_by(&key_pair, &ca).unwrap();
 	check_cert_ca(cert.der(), &cert, ca_cert.der());
@@ -151,7 +151,7 @@ fn test_botan_separate_ca() {
 #[test]
 fn test_botan_imported_ca() {
 	let (mut params, ca_key) = default_params();
-	params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+	params.basic_constraints = Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained));
 	let ca_cert = params.self_signed(&ca_key).unwrap();
 	let ca_cert_der = ca_cert.der();
 	let ca = Issuer::from_ca_cert_der(ca_cert.der(), ca_key).unwrap();
@@ -166,7 +166,7 @@ fn test_botan_imported_ca() {
 	// Botan has a sanity check that enforces a maximum expiration date
 	params.not_after = rcgen::date_time_ymd(3016, 1, 1);
 
-	let key_pair = KeyPair::generate().unwrap();
+	let (key_pair, _) = KeyPair::generate().unwrap();
 	let cert = params.signed_by(&key_pair, &ca).unwrap();
 	check_cert_ca(cert.der(), &cert, ca_cert_der);
 }
@@ -179,7 +179,7 @@ fn test_botan_imported_ca_with_printable_string() {
 		DnType::CountryName,
 		DnValue::PrintableString("US".try_into().unwrap()),
 	);
-	params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+	params.basic_constraints = Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained));
 	let ca_cert = params.self_signed(&imported_ca_key).unwrap();
 	let ca = Issuer::from_ca_cert_der(ca_cert.der(), imported_ca_key).unwrap();
 
@@ -192,7 +192,7 @@ fn test_botan_imported_ca_with_printable_string() {
 		.push(DnType::CommonName, "Dev domain");
 	// Botan has a sanity check that enforces a maximum expiration date
 	params.not_after = rcgen::date_time_ymd(3016, 1, 1);
-	let key_pair = KeyPair::generate().unwrap();
+	let (key_pair, _) = KeyPair::generate().unwrap();
 	let cert = params.signed_by(&key_pair, &ca).unwrap();
 
 	check_cert_ca(cert.der(), &cert, ca_cert.der());
@@ -201,42 +201,39 @@ fn test_botan_imported_ca_with_printable_string() {
 #[test]
 fn test_botan_crl_parse() {
 	// Create an issuer CA.
-	let alg = &rcgen::PKCS_ECDSA_P256_SHA256;
-	let (mut issuer, _) = util::default_params();
-	issuer.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+	let alg = &rcgen::ECDSA_P256_SHA256;
+	let (mut issuer, _, _) = util::default_params();
+	issuer.basic_constraints = Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained));
 	issuer.key_usages = vec![
 		KeyUsagePurpose::KeyCertSign,
 		KeyUsagePurpose::DigitalSignature,
 		KeyUsagePurpose::CrlSign,
 	];
-	let issuer_key = KeyPair::generate_for(alg).unwrap();
+	let (issuer_key, _) = KeyPair::generate_for(alg).unwrap();
 	let ca = Issuer::new(issuer, issuer_key);
 
 	// Create an end entity cert issued by the issuer.
-	let (mut ee, _) = util::default_params();
-	ee.is_ca = IsCa::NoCa;
+	let (mut ee, _, _) = util::default_params();
+	ee.basic_constraints = None;
 	ee.serial_number = Some(SerialNumber::from(99999));
 	// Botan has a sanity check that enforces a maximum expiration date
 	ee.not_after = rcgen::date_time_ymd(3016, 1, 1);
-	let ee_key = KeyPair::generate_for(alg).unwrap();
+	let (ee_key, _) = KeyPair::generate_for(alg).unwrap();
 	let ee_cert = ee.signed_by(&ee_key, &ca).unwrap();
 	let botan_ee = botan::Certificate::load(ee_cert.der()).unwrap();
 
 	// Generate a CRL with the issuer that revokes the EE cert.
 	let now = OffsetDateTime::now_utc();
-	let crl = CertificateRevocationListParams {
-		this_update: now,
-		next_update: now + Duration::weeks(1),
-		crl_number: rcgen::SerialNumber::from(1234),
-		issuing_distribution_point: None,
-		revoked_certs: vec![RevokedCertParams {
-			serial_number: ee.serial_number.clone().unwrap(),
-			revocation_time: now,
-			reason_code: Some(RevocationReason::KeyCompromise),
-			invalidity_date: None,
-		}],
-		key_identifier_method: rcgen::KeyIdMethod::Sha256,
-	};
+	let mut revoked_certs = RevokedCertParams::new(ee.serial_number.clone().unwrap(), now);
+	revoked_certs.reason_code = Some(RevocationReason::KeyCompromise);
+
+	let mut crl = CertificateRevocationListParams::new(
+		now,
+		now + Duration::weeks(1),
+		SerialNumber::from(1234),
+		rcgen::KeyIdMethod::Sha256,
+	);
+	crl.revoked_certs = vec![revoked_certs];
 
 	let crl = crl.signed_by(&ca).unwrap();
 

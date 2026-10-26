@@ -12,16 +12,16 @@ mod test_key_params_mismatch {
 	#[test]
 	fn test_key_params_mismatch() {
 		let available_key_params = [
-			&rcgen::PKCS_RSA_SHA256,
-			&rcgen::PKCS_ECDSA_P256_SHA256,
-			&rcgen::PKCS_ECDSA_P384_SHA384,
+			&rcgen::RSA_PKCS1_SHA256,
+			&rcgen::ECDSA_P256_SHA256,
+			&rcgen::ECDSA_P384_SHA384,
 			#[cfg(feature = "aws_lc_rs")]
-			&rcgen::PKCS_ECDSA_P521_SHA256,
+			&rcgen::ECDSA_P521_SHA256,
 			#[cfg(feature = "aws_lc_rs")]
-			&rcgen::PKCS_ECDSA_P521_SHA384,
+			&rcgen::ECDSA_P521_SHA384,
 			#[cfg(feature = "aws_lc_rs")]
-			&rcgen::PKCS_ECDSA_P521_SHA512,
-			&rcgen::PKCS_ED25519,
+			&rcgen::ECDSA_P521_SHA512,
+			&rcgen::ED25519,
 		];
 		for (i, kalg_1) in available_key_params.iter().enumerate() {
 			for (j, kalg_2) in available_key_params.iter().enumerate() {
@@ -33,7 +33,7 @@ mod test_key_params_mismatch {
 
 				assert_ne!(*kalg_1, *kalg_2);
 				let names = [format!("{kalg_1:?}"), format!("{kalg_2:?}")];
-				if names.into_iter().all(|n| n.starts_with("PKCS_ECDSA_P521")) {
+				if names.into_iter().all(|n| n.starts_with("ECDSA_P521")) {
 					continue;
 				}
 
@@ -49,7 +49,7 @@ mod test_key_params_mismatch {
 
 #[cfg(feature = "x509-parser")]
 mod test_x509_custom_ext {
-	use rcgen::CustomExtension;
+	use rcgen::{Criticality, CustomExtension};
 	use verify_tests as util;
 	use x509_parser::oid_registry::asn1_rs;
 	use x509_parser::prelude::{
@@ -63,14 +63,14 @@ mod test_x509_custom_ext {
 		let test_ext = yasna::construct_der(|writer| {
 			writer.write_utf8_string("🦀 greetz to ferris 🦀");
 		});
-		let mut custom_ext = CustomExtension::from_oid_content(
+		let custom_ext = CustomExtension::new(
 			test_oid.iter().unwrap().collect::<Vec<u64>>().as_slice(),
+			Criticality::Critical,
 			test_ext.clone(),
 		);
-		custom_ext.set_criticality(true);
 
 		// Generate a certificate with the custom extension, parse it with x509-parser.
-		let (mut params, test_key) = util::default_params();
+		let (mut params, test_key, _) = util::default_params();
 		params.custom_extensions = vec![custom_ext];
 		// Ensure the custom exts. being omitted into a CSR doesn't require SAN ext being present.
 		// See https://github.com/rustls/rcgen/issues/122
@@ -152,7 +152,7 @@ mod test_csr_custom_attributes {
 
 		// Serialize a DER-encoded CSR
 		let params = CertificateParams::default();
-		let key_pair = KeyPair::generate().unwrap();
+		let (key_pair, _) = KeyPair::generate().unwrap();
 		let csr = params
 			.serialize_request_with_attributes(&key_pair, vec![challenge_password_attribute])
 			.unwrap();
@@ -172,7 +172,7 @@ mod test_csr_custom_attributes {
 
 #[cfg(feature = "x509-parser")]
 mod test_csr_basic_constraints {
-	use rcgen::{BasicConstraints, CertificateSigningRequestParams, Error, IsCa};
+	use rcgen::{BasicConstraints, CertificateSigningRequestParams, Error, PathLenConstraint};
 
 	/// Tests deserializing a csr with a basic constraint of CA:TRUE,pathlen:5
 	///
@@ -184,8 +184,8 @@ mod test_csr_basic_constraints {
 				.unwrap();
 
 		assert_eq!(
-			csr_params.params.is_ca,
-			IsCa::Ca(BasicConstraints::Constrained(5))
+			csr_params.params.basic_constraints,
+			Some(BasicConstraints::Ca(PathLenConstraint::Constrained(5)))
 		);
 	}
 
@@ -257,8 +257,8 @@ RioOvAyCH6bFMvSJxZm7FYM=
 			CertificateSigningRequestParams::from_pem(CSR_TEST_BASIC_CONSTRAINTS_CA_TRUE).unwrap();
 
 		assert_eq!(
-			csr_params.params.is_ca,
-			IsCa::Ca(BasicConstraints::Unconstrained)
+			csr_params.params.basic_constraints,
+			Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained))
 		);
 	}
 
@@ -294,7 +294,10 @@ lZLnFMmv1pkn052qtQ==
 		let csr_params =
 			CertificateSigningRequestParams::from_pem(CSR_TEST_BASIC_CONSTRAINTS_CA_FALSE).unwrap();
 
-		assert_eq!(csr_params.params.is_ca, IsCa::ExplicitNoCa);
+		assert_eq!(
+			csr_params.params.basic_constraints,
+			Some(BasicConstraints::EndEntity)
+		);
 	}
 
 	/*
@@ -486,7 +489,7 @@ mod test_csr_extension_request {
 	fn dont_write_sans_extension_if_no_sans_are_present() {
 		let mut params = CertificateParams::default();
 		params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-		let key_pair = KeyPair::generate().unwrap();
+		let (key_pair, _) = KeyPair::generate().unwrap();
 		let csr = params.serialize_request(&key_pair).unwrap();
 		let (_, parsed_csr) = X509CertificationRequest::from_der(csr.der()).unwrap();
 		assert!(!parsed_csr
@@ -501,7 +504,7 @@ mod test_csr_extension_request {
 		params
 			.extended_key_usages
 			.push(ExtendedKeyUsagePurpose::ClientAuth);
-		let key_pair = KeyPair::generate().unwrap();
+		let (key_pair, _) = KeyPair::generate().unwrap();
 		let csr = params.serialize_request(&key_pair).unwrap();
 		let (_, parsed_csr) = X509CertificationRequest::from_der(csr.der()).unwrap();
 		let requested_extensions = parsed_csr
@@ -568,7 +571,7 @@ mod test_csr {
 
 	fn generate_and_test_parsed_csr(params: &CertificateParams) {
 		// Generate a key pair for the CSR
-		let key_pair = KeyPair::generate().unwrap();
+		let (key_pair, _) = KeyPair::generate().unwrap();
 		// Serialize the CSR into DER from the given parameters
 		let csr = params.serialize_request(&key_pair).unwrap();
 		// Parse the CSR we just serialized
@@ -590,7 +593,7 @@ mod test_subject_alternative_name_criticality {
 
 	#[test]
 	fn with_subject_sans_not_critical() {
-		let (params, keypair) = default_params();
+		let (params, keypair, _) = default_params();
 		assert!(
 			!params
 				.distinguished_name
@@ -611,7 +614,7 @@ mod test_subject_alternative_name_criticality {
 
 	#[test]
 	fn without_subject_sans_critical() {
-		let (mut params, keypair) = default_params();
+		let (mut params, keypair, _) = default_params();
 		params.distinguished_name = Default::default();
 
 		let cert = params.self_signed(&keypair).unwrap();

@@ -6,19 +6,21 @@ use pem::Pem;
 use pki_types::{CertificateDer, CertificateSigningRequestDer};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 use yasna::models::ObjectIdentifier;
-use yasna::{DERWriter, DERWriterSeq, Tag};
+use yasna::Tag;
 
-use crate::crl::CrlDistributionPoint;
 use crate::csr::CertificateSigningRequest;
+use crate::extension::{
+	AuthorityKeyIdentifier, Extensions, NonEmptySlice, SubjectAlternativeName, SubjectKeyIdentifier,
+};
 use crate::key_pair::{serialize_public_key_der, sign_der, PublicKeyData};
 #[cfg(feature = "crypto")]
 use crate::ring_like::digest;
 #[cfg(feature = "pem")]
 use crate::ENCODE_CONFIG;
 use crate::{
-	oid, write_distinguished_name, write_dt_utc_or_generalized,
-	write_x509_authority_key_identifier, write_x509_extension, DistinguishedName, Error, Issuer,
-	KeyIdMethod, KeyUsagePurpose, SanType, SerialNumber, SigningKey,
+	oid, write_distinguished_name, write_dt_utc_or_generalized, BasicConstraints,
+	CrlDistributionPoint, CustomExtension, DistinguishedName, Error, ExtendedKeyUsagePurpose,
+	GeneralName, Issuer, KeyIdMethod, KeyUsagePurpose, NameConstraints, SerialNumber, SigningKey,
 };
 
 /// An issued certificate
@@ -57,9 +59,15 @@ pub struct CertificateParams {
 	pub not_before: OffsetDateTime,
 	pub not_after: OffsetDateTime,
 	pub serial_number: Option<SerialNumber>,
-	pub subject_alt_names: Vec<SanType>,
+	pub subject_alt_names: Vec<GeneralName>,
 	pub distinguished_name: DistinguishedName,
-	pub is_ca: IsCa,
+	/// Basic constraints controlling whether this certificate can act as a certificate authority (CA).
+	///
+	/// Use `Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained))` to allow
+	/// this certificate to sign other certificates without a path length limit.
+	/// `Some(BasicConstraints::EndEntity)` explicitly marks it as a non-CA certificate.
+	/// The default, `None`, omits the extension.
+	pub basic_constraints: Option<BasicConstraints>,
 	pub key_usages: Vec<KeyUsagePurpose>,
 	pub extended_key_usages: Vec<ExtendedKeyUsagePurpose>,
 	pub name_constraints: Option<NameConstraints>,
@@ -91,7 +99,7 @@ impl Default for CertificateParams {
 			serial_number: None,
 			subject_alt_names: Vec::new(),
 			distinguished_name,
-			is_ca: IsCa::NoCa,
+			basic_constraints: None,
 			key_usages: Vec::new(),
 			extended_key_usages: Vec::new(),
 			name_constraints: None,
@@ -114,8 +122,8 @@ impl CertificateParams {
 			.into_iter()
 			.map(|s| {
 				Ok(match IpAddr::from_str(&s) {
-					Ok(ip) => SanType::IpAddress(ip),
-					Err(_) => SanType::DnsName(s.try_into()?),
+					Ok(ip) => GeneralName::IpAddress(ip),
+					Err(_) => GeneralName::DnsName(s.try_into()?),
 				})
 			})
 			.collect::<Result<Vec<_>, _>>()?;
@@ -171,8 +179,8 @@ impl CertificateParams {
 			.map_err(|_| Error::CouldNotParseCertificate)?;
 
 		Ok(CertificateParams {
-			is_ca: IsCa::from_x509(&x509)?,
-			subject_alt_names: SanType::from_x509(&x509)?,
+			basic_constraints: BasicConstraints::from_x509(&x509)?,
+			subject_alt_names: GeneralName::from_x509(&x509)?,
 			key_usages: KeyUsagePurpose::from_x509(&x509)?,
 			extended_key_usages: ExtendedKeyUsagePurpose::from_x509(&x509)?,
 			name_constraints: NameConstraints::from_x509(&x509)?,
@@ -185,142 +193,25 @@ impl CertificateParams {
 		})
 	}
 
-	/// Write a CSR extension request attribute as defined in [RFC 2985].
+	/// Returns the X.509 extensions for a CSR extension request attribute as defined
+	/// in [RFC 2985].
+	///
+	/// Returns an [`Error`] if the described extensions are invalid.
 	///
 	/// [RFC 2985]: <https://datatracker.ietf.org/doc/html/rfc2985>
-	fn write_extension_request_attribute(&self, writer: DERWriter) {
-		writer.write_sequence(|writer| {
-			writer.next().write_oid(&ObjectIdentifier::from_slice(
-				oid::PKCS_9_AT_EXTENSION_REQUEST,
-			));
-			writer.next().write_set(|writer| {
-				writer.next().write_sequence(|writer| {
-					self.write_key_usage(writer.next());
-					self.write_subject_alt_names(writer.next());
-					self.write_extended_key_usage(writer.next());
-					self.write_ca_extensions(writer, None);
-					for ext in &self.custom_extensions {
-						write_x509_extension(writer.next(), &ext.oid, ext.critical, |writer| {
-							writer.write_der(ext.content())
-						});
-					}
-				});
-			});
-		});
-	}
+	fn csr_extensions(&self) -> Result<Extensions<'_>, Error> {
+		let mut exts = Extensions::default();
 
-	/// Write a certificate's KeyUsage as defined in RFC 5280.
-	fn write_key_usage(&self, writer: DERWriter) {
-		if self.key_usages.is_empty() {
-			return;
+		exts.push_if_some(SubjectAlternativeName::from_params(self))?;
+		exts.push_if_some(NonEmptySlice::new(&self.key_usages))?;
+		exts.push_if_some(NonEmptySlice::new(&self.extended_key_usages))?;
+		exts.push_if_some(self.basic_constraints)?;
+
+		for custom_ext in &self.custom_extensions {
+			exts.push(custom_ext)?;
 		}
 
-		// "When present, conforming CAs SHOULD mark this extension as critical."
-		write_x509_extension(writer, oid::KEY_USAGE, true, |writer| {
-			// u16 is large enough to encode the largest possible key usage (two-bytes)
-			let bit_string = self.key_usages.iter().fold(0u16, |bit_string, key_usage| {
-				bit_string | key_usage.to_u16()
-			});
-
-			match u16::BITS - bit_string.trailing_zeros() {
-				bits @ 0..=8 => {
-					writer.write_bitvec_bytes(&bit_string.to_be_bytes()[..1], bits as usize)
-				},
-				bits @ 9..=16 => {
-					writer.write_bitvec_bytes(&bit_string.to_be_bytes(), bits as usize)
-				},
-				_ => unreachable!(),
-			}
-		});
-	}
-
-	fn write_extended_key_usage(&self, writer: DERWriter) {
-		if !self.extended_key_usages.is_empty() {
-			write_x509_extension(writer, oid::EXT_KEY_USAGE, false, |writer| {
-				writer.write_sequence(|writer| {
-					for usage in &self.extended_key_usages {
-						writer
-							.next()
-							.write_oid(&ObjectIdentifier::from_slice(usage.oid()));
-					}
-				});
-			});
-		}
-	}
-
-	/// Write a certificate's BasicConstraints as defined in RFC 5280.
-	fn write_ca_extensions(&self, writer: &mut DERWriterSeq, pub_key_spki: Option<&[u8]>) {
-		let is_ca = match &self.is_ca {
-			IsCa::Ca(bc) => Some(bc),
-			IsCa::ExplicitNoCa => None,
-			IsCa::NoCa => return,
-		};
-
-		if let Some(pub_key_spki) = pub_key_spki {
-			write_x509_extension(
-				writer.next(),
-				oid::SUBJECT_KEY_IDENTIFIER,
-				false,
-				|writer| {
-					writer.write_bytes(&self.key_identifier_method.derive(pub_key_spki));
-				},
-			);
-		}
-
-		// Write basic_constraints
-		write_x509_extension(writer.next(), oid::BASIC_CONSTRAINTS, true, |writer| {
-			writer.write_sequence(|writer| {
-				let Some(constraints) = is_ca else {
-					return;
-				};
-
-				writer.next().write_bool(true); // cA flag
-				match constraints {
-					BasicConstraints::Unconstrained => {},
-					BasicConstraints::Constrained(path_len_constraint) => {
-						writer.next().write_u8(*path_len_constraint); // pathLenConstraint integer
-					},
-				}
-			});
-		});
-	}
-
-	fn write_subject_alt_names(&self, writer: DERWriter) {
-		if self.subject_alt_names.is_empty() {
-			return;
-		}
-
-		// Per https://tools.ietf.org/html/rfc5280#section-4.1.2.6, SAN must be marked
-		// as critical if subject is empty.
-		let critical = self.distinguished_name.entries.is_empty();
-		write_x509_extension(writer, oid::SUBJECT_ALT_NAME, critical, |writer| {
-			writer.write_sequence(|writer| {
-				for san in self.subject_alt_names.iter() {
-					writer.next().write_tagged_implicit(
-						Tag::context(san.tag()),
-						|writer| match san {
-							SanType::Rfc822Name(name)
-							| SanType::DnsName(name)
-							| SanType::URI(name) => writer.write_ia5_string(name.as_str()),
-							SanType::IpAddress(IpAddr::V4(addr)) => {
-								writer.write_bytes(&addr.octets())
-							},
-							SanType::IpAddress(IpAddr::V6(addr)) => {
-								writer.write_bytes(&addr.octets())
-							},
-							SanType::OtherName((oid, value)) => {
-								// otherName SEQUENCE { OID, [0] explicit any defined by oid }
-								// https://datatracker.ietf.org/doc/html/rfc5280#page-38
-								writer.write_sequence(|writer| {
-									writer.next().write_oid(&ObjectIdentifier::from_slice(oid));
-									value.write_der(writer.next());
-								});
-							},
-						},
-					);
-				}
-			});
-		});
+		Ok(exts)
 	}
 
 	/// Generate and serialize a certificate signing request (CSR).
@@ -362,7 +253,7 @@ impl CertificateParams {
 			serial_number,
 			subject_alt_names,
 			distinguished_name,
-			is_ca,
+			basic_constraints,
 			key_usages,
 			extended_key_usages,
 			name_constraints,
@@ -373,7 +264,9 @@ impl CertificateParams {
 		} = self;
 		// - subject_key will be used by the caller
 		// - not_before and not_after cannot be put in a CSR
-		// - key_identifier_method is here because self.write_extended_key_usage uses it
+		// - The extension request fields (subject_alt_names, key_usages,
+		//   extended_key_usages, basic_constraints, custom_extensions) are handled by
+		//   self.csr_extensions()
 		// - There might be a use case for specifying the key identifier
 		// in the CSR, but in the current API it can't be distinguished
 		// from the defaults so this is left for a later version if
@@ -382,7 +275,11 @@ impl CertificateParams {
 			not_before,
 			not_after,
 			key_identifier_method,
+			subject_alt_names,
+			key_usages,
 			extended_key_usages,
+			basic_constraints,
+			custom_extensions,
 		);
 		if serial_number.is_some()
 			|| name_constraints.is_some()
@@ -392,12 +289,9 @@ impl CertificateParams {
 			return Err(Error::UnsupportedInCsr);
 		}
 
-		// Whether or not to write an extension request attribute
-		let write_extension_request = !key_usages.is_empty()
-			|| !subject_alt_names.is_empty()
-			|| !extended_key_usages.is_empty()
-			|| !custom_extensions.is_empty()
-			|| matches!(is_ca, IsCa::ExplicitNoCa | IsCa::Ca(_));
+		// The extension request attribute is elided entirely when the built
+		// collection is empty.
+		let extension_request = self.csr_extensions()?;
 
 		let der = sign_der(subject_key, |writer| {
 			// Write version
@@ -411,9 +305,7 @@ impl CertificateParams {
 				.write_tagged_implicit(Tag::context(0), |writer| {
 					// RFC 2986 specifies that attributes are a SET OF Attribute
 					writer.write_set_of(|writer| {
-						if write_extension_request {
-							self.write_extension_request_attribute(writer.next());
-						}
+						extension_request.write_csr_attribute(writer);
 
 						for Attribute { oid, values } in attrs {
 							writer.next().write_sequence(|writer| {
@@ -437,19 +329,9 @@ impl CertificateParams {
 		pub_key: &K,
 		issuer: &Issuer<'_, impl SigningKey>,
 	) -> Result<CertificateDer<'static>, Error> {
-		// An empty distribution point would be encoded as an empty fullName,
-		// violating GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName
-		// (RFC 5280 §4.2.1.13).
-		if self
-			.crl_distribution_points
-			.iter()
-			.any(|dp| dp.uris.is_empty())
-		{
-			return Err(Error::EmptyCrlDistributionPointUris);
-		}
-
+		let pub_key_spki = pub_key.subject_public_key_info();
+		let extensions = self.extensions(&pub_key_spki, issuer)?;
 		let der = sign_der(&issuer.signing_key, |writer| {
-			let pub_key_spki = pub_key.subject_public_key_info();
 			// Write version
 			writer.next().write_tagged(Tag::context(0), |writer| {
 				writer.write_u8(2);
@@ -490,23 +372,9 @@ impl CertificateParams {
 			write_distinguished_name(writer.next(), &self.distinguished_name);
 			// Write subjectPublicKeyInfo
 			serialize_public_key_der(pub_key, writer.next());
-			// write extensions
-			let should_write_exts = self.use_authority_key_identifier_extension
-				|| !self.subject_alt_names.is_empty()
-				|| !self.key_usages.is_empty()
-				|| !self.extended_key_usages.is_empty()
-				|| self.name_constraints.iter().any(|c| !c.is_empty())
-				|| !self.crl_distribution_points.is_empty()
-				|| matches!(self.is_ca, IsCa::ExplicitNoCa)
-				|| matches!(self.is_ca, IsCa::Ca(_))
-				|| !self.custom_extensions.is_empty();
-			if !should_write_exts {
-				return Ok(());
-			}
-
-			writer.next().write_tagged(Tag::context(3), |writer| {
-				writer.write_sequence(|writer| self.write_extensions(writer, &pub_key_spki, issuer))
-			})?;
+			// Write extensions. The field is omitted entirely when the built
+			// collection is empty.
+			extensions.write_cert_der(writer.next());
 
 			Ok(())
 		})?;
@@ -514,77 +382,39 @@ impl CertificateParams {
 		Ok(der.into())
 	}
 
-	fn write_extensions(
+	/// Returns the X.509 extensions that the [`CertificateParams`] describe.
+	///
+	/// Returns an [`Error`] if the described extensions are invalid.
+	fn extensions(
 		&self,
-		writer: &mut DERWriterSeq,
 		pub_key_spki: &[u8],
 		issuer: &Issuer<'_, impl SigningKey>,
-	) -> Result<(), Error> {
+	) -> Result<Extensions<'_>, Error> {
+		let mut exts = Extensions::default();
+
 		if self.use_authority_key_identifier_extension {
-			write_x509_authority_key_identifier(
-				writer.next(),
-				match issuer.key_identifier_method.as_ref() {
-					KeyIdMethod::PreSpecified(aki) => aki.clone(),
-					#[cfg(feature = "crypto")]
-					_ => issuer
-						.key_identifier_method
-						.derive(issuer.signing_key.subject_public_key_info()),
-				},
-			);
+			exts.push(AuthorityKeyIdentifier::from(issuer))?;
 		}
 
-		self.write_subject_alt_names(writer.next());
-		self.write_key_usage(writer.next());
-		self.write_extended_key_usage(writer.next());
+		exts.push_if_some(SubjectAlternativeName::from_params(self))?;
+		exts.push_if_some(NonEmptySlice::new(&self.key_usages))?;
+		exts.push_if_some(NonEmptySlice::new(&self.extended_key_usages))?;
+		exts.push_if_some(self.name_constraints.as_ref())?;
+		exts.push_if_some(NonEmptySlice::new(&self.crl_distribution_points))?;
 
-		if let Some(name_constraints) = &self.name_constraints {
-			// If both trees are empty, the extension must be omitted.
-			if !name_constraints.is_empty() {
-				write_x509_extension(writer.next(), oid::NAME_CONSTRAINTS, true, |writer| {
-					writer.write_sequence(|writer| {
-						if !name_constraints.permitted_subtrees.is_empty() {
-							write_general_subtrees(
-								writer.next(),
-								0,
-								&name_constraints.permitted_subtrees,
-							);
-						}
-						if !name_constraints.excluded_subtrees.is_empty() {
-							write_general_subtrees(
-								writer.next(),
-								1,
-								&name_constraints.excluded_subtrees,
-							);
-						}
-					});
-				});
-			}
+		// RFC 5280 §4.2.1.2 describes the SKI as a MUST for CA certificates and a
+		// SHOULD for end entity certificates, so it is emitted for all certificates.
+		exts.push(SubjectKeyIdentifier::new(
+			&self.key_identifier_method,
+			pub_key_spki,
+		))?;
+		exts.push_if_some(self.basic_constraints)?;
+
+		for custom_ext in &self.custom_extensions {
+			exts.push(custom_ext)?;
 		}
 
-		if !self.crl_distribution_points.is_empty() {
-			write_x509_extension(
-				writer.next(),
-				oid::CRL_DISTRIBUTION_POINTS,
-				false,
-				|writer| {
-					writer.write_sequence(|writer| {
-						for distribution_point in &self.crl_distribution_points {
-							distribution_point.write_der(writer.next());
-						}
-					})
-				},
-			);
-		}
-
-		self.write_ca_extensions(writer, Some(pub_key_spki));
-
-		for ext in &self.custom_extensions {
-			write_x509_extension(writer.next(), &ext.oid, ext.critical, |writer| {
-				writer.write_der(ext.content())
-			});
-		}
-
-		Ok(())
+		Ok(exts)
 	}
 
 	/// Insert an extended key usage (EKU) into the parameters if it does not already exist
@@ -601,36 +431,12 @@ impl AsRef<CertificateParams> for CertificateParams {
 	}
 }
 
-fn write_general_subtrees(writer: DERWriter, tag: u64, general_subtrees: &[GeneralSubtree]) {
-	writer.write_tagged_implicit(Tag::context(tag), |writer| {
-		writer.write_sequence(|writer| {
-			for subtree in general_subtrees.iter() {
-				writer.next().write_sequence(|writer| {
-					let writer = writer.next();
-					let tag = Tag::context(subtree.tag());
-					match subtree {
-						GeneralSubtree::Rfc822Name(name) | GeneralSubtree::DnsName(name) => writer
-							.write_tagged_implicit(tag, |writer| writer.write_ia5_string(name)),
-						// `Name` is a CHOICE, so X.680 §31.2.7 requires explicit tagging.
-						GeneralSubtree::DirectoryName(name) => writer
-							.write_tagged(tag, |writer| write_distinguished_name(writer, name)),
-						GeneralSubtree::IpAddress(subnet) => writer
-							.write_tagged_implicit(tag, |writer| {
-								writer.write_bytes(&subnet.to_bytes())
-							}),
-					}
-					// minimum must be 0 (the default) and maximum must be absent
-				});
-			}
-		});
-	});
-}
-
 /// A PKCS #10 CSR attribute, as defined in [RFC 5280] and constrained
 /// by [RFC 2986].
 ///
 /// [RFC 5280]: <https://datatracker.ietf.org/doc/html/rfc5280#appendix-A.1>
 /// [RFC 2986]: <https://datatracker.ietf.org/doc/html/rfc2986#section-4>
+#[allow(clippy::exhaustive_structs)]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct Attribute {
 	/// `AttributeType` of the `Attribute`, defined as an `OBJECT IDENTIFIER`.
@@ -643,59 +449,6 @@ pub struct Attribute {
 	///
 	/// [RFC 2986]: https://datatracker.ietf.org/doc/html/rfc2986#section-4
 	pub values: Vec<u8>,
-}
-
-/// A custom extension of a certificate, as specified in
-/// [RFC 5280](https://tools.ietf.org/html/rfc5280#section-4.2)
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct CustomExtension {
-	oid: Vec<u64>,
-	critical: bool,
-
-	/// The content must be DER-encoded
-	content: Vec<u8>,
-}
-
-impl CustomExtension {
-	/// Creates a new acmeIdentifier extension for ACME TLS-ALPN-01
-	/// as specified in [RFC 8737](https://tools.ietf.org/html/rfc8737#section-3)
-	///
-	/// Panics if the passed `sha_digest` parameter doesn't hold 32 bytes (256 bits).
-	pub fn new_acme_identifier(sha_digest: &[u8]) -> Self {
-		assert_eq!(sha_digest.len(), 32, "wrong size of sha_digest");
-		let content = yasna::construct_der(|writer| {
-			writer.write_bytes(sha_digest);
-		});
-		Self {
-			oid: oid::PE_ACME.to_owned(),
-			critical: true,
-			content,
-		}
-	}
-	/// Create a new custom extension with the specified content
-	pub fn from_oid_content(oid: &[u64], content: Vec<u8>) -> Self {
-		Self {
-			oid: oid.to_owned(),
-			critical: false,
-			content,
-		}
-	}
-	/// Sets the criticality flag of the extension.
-	pub fn set_criticality(&mut self, criticality: bool) {
-		self.critical = criticality;
-	}
-	/// Obtains the criticality flag of the extension.
-	pub fn criticality(&self) -> bool {
-		self.critical
-	}
-	/// Obtains the content of the extension.
-	pub fn content(&self) -> &[u8] {
-		&self.content
-	}
-	/// Obtains the OID components of the extensions, as u64 pieces
-	pub fn oid_components(&self) -> impl Iterator<Item = u64> + '_ {
-		self.oid.iter().copied()
-	}
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -746,289 +499,6 @@ impl DnType {
 	}
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-/// One of the purposes contained in the [extended key usage extension](https://tools.ietf.org/html/rfc5280#section-4.2.1.12)
-pub enum ExtendedKeyUsagePurpose {
-	/// anyExtendedKeyUsage
-	Any,
-	/// id-kp-serverAuth
-	ServerAuth,
-	/// id-kp-clientAuth
-	ClientAuth,
-	/// id-kp-codeSigning
-	CodeSigning,
-	/// id-kp-emailProtection
-	EmailProtection,
-	/// id-kp-timeStamping
-	TimeStamping,
-	/// id-kp-OCSPSigning
-	OcspSigning,
-	/// A custom purpose not from the pre-specified list of purposes
-	Other(Vec<u64>),
-}
-
-impl ExtendedKeyUsagePurpose {
-	#[cfg(all(test, feature = "x509-parser"))]
-	fn from_x509(x509: &x509_parser::certificate::X509Certificate<'_>) -> Result<Vec<Self>, Error> {
-		let extended_key_usage = x509
-			.extended_key_usage()
-			.map_err(|_| Error::CouldNotParseCertificate)?
-			.map(|ext| ext.value);
-
-		let mut extended_key_usages = Vec::new();
-		if let Some(extended_key_usage) = extended_key_usage {
-			if extended_key_usage.any {
-				extended_key_usages.push(Self::Any);
-			}
-			if extended_key_usage.server_auth {
-				extended_key_usages.push(Self::ServerAuth);
-			}
-			if extended_key_usage.client_auth {
-				extended_key_usages.push(Self::ClientAuth);
-			}
-			if extended_key_usage.code_signing {
-				extended_key_usages.push(Self::CodeSigning);
-			}
-			if extended_key_usage.email_protection {
-				extended_key_usages.push(Self::EmailProtection);
-			}
-			if extended_key_usage.time_stamping {
-				extended_key_usages.push(Self::TimeStamping);
-			}
-			if extended_key_usage.ocsp_signing {
-				extended_key_usages.push(Self::OcspSigning);
-			}
-		}
-
-		Ok(extended_key_usages)
-	}
-
-	fn oid(&self) -> &[u64] {
-		use ExtendedKeyUsagePurpose::*;
-		match self {
-			// anyExtendedKeyUsage
-			Any => &[2, 5, 29, 37, 0],
-			// id-kp-*
-			ServerAuth => &[1, 3, 6, 1, 5, 5, 7, 3, 1],
-			ClientAuth => &[1, 3, 6, 1, 5, 5, 7, 3, 2],
-			CodeSigning => &[1, 3, 6, 1, 5, 5, 7, 3, 3],
-			EmailProtection => &[1, 3, 6, 1, 5, 5, 7, 3, 4],
-			TimeStamping => &[1, 3, 6, 1, 5, 5, 7, 3, 8],
-			OcspSigning => &[1, 3, 6, 1, 5, 5, 7, 3, 9],
-			Other(oid) => oid,
-		}
-	}
-}
-
-/// The [NameConstraints extension](https://tools.ietf.org/html/rfc5280#section-4.2.1.10)
-/// (only relevant for CA certificates)
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct NameConstraints {
-	/// A list of subtrees that the domain has to match.
-	pub permitted_subtrees: Vec<GeneralSubtree>,
-	/// A list of subtrees that the domain must not match.
-	///
-	/// Any name matching an excluded subtree is invalid even if it also matches a permitted subtree.
-	pub excluded_subtrees: Vec<GeneralSubtree>,
-}
-
-impl NameConstraints {
-	#[cfg(all(test, feature = "x509-parser"))]
-	fn from_x509(
-		x509: &x509_parser::certificate::X509Certificate<'_>,
-	) -> Result<Option<Self>, Error> {
-		let constraints = x509
-			.name_constraints()
-			.map_err(|_| Error::CouldNotParseCertificate)?
-			.map(|ext| ext.value);
-
-		let Some(constraints) = constraints else {
-			return Ok(None);
-		};
-
-		let permitted_subtrees = if let Some(permitted) = &constraints.permitted_subtrees {
-			GeneralSubtree::from_x509(permitted)?
-		} else {
-			Vec::new()
-		};
-
-		let excluded_subtrees = if let Some(excluded) = &constraints.excluded_subtrees {
-			GeneralSubtree::from_x509(excluded)?
-		} else {
-			Vec::new()
-		};
-
-		Ok(Some(Self {
-			permitted_subtrees,
-			excluded_subtrees,
-		}))
-	}
-
-	fn is_empty(&self) -> bool {
-		self.permitted_subtrees.is_empty() && self.excluded_subtrees.is_empty()
-	}
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-#[allow(missing_docs)]
-#[non_exhaustive]
-/// General Subtree type.
-///
-/// This type has similarities to the [`SanType`] enum but is not equal.
-/// For example, `GeneralSubtree` has CIDR subnets for ip addresses
-/// while [`SanType`] has IP addresses.
-pub enum GeneralSubtree {
-	/// Also known as E-Mail address
-	Rfc822Name(String),
-	DnsName(String),
-	DirectoryName(DistinguishedName),
-	IpAddress(CidrSubnet),
-}
-
-impl GeneralSubtree {
-	#[cfg(all(test, feature = "x509-parser"))]
-	fn from_x509(
-		subtrees: &[x509_parser::extensions::GeneralSubtree<'_>],
-	) -> Result<Vec<Self>, Error> {
-		use x509_parser::extensions::GeneralName;
-
-		let mut result = Vec::new();
-		for subtree in subtrees {
-			let subtree = match &subtree.base {
-				GeneralName::RFC822Name(s) => Self::Rfc822Name(s.to_string()),
-				GeneralName::DNSName(s) => Self::DnsName(s.to_string()),
-				GeneralName::DirectoryName(n) => {
-					Self::DirectoryName(DistinguishedName::from_name(n)?)
-				},
-				GeneralName::IPAddress(bytes) if bytes.len() == 8 => {
-					let addr: [u8; 4] = bytes[..4].try_into().unwrap();
-					let mask: [u8; 4] = bytes[4..].try_into().unwrap();
-					Self::IpAddress(CidrSubnet::V4(addr, mask))
-				},
-				GeneralName::IPAddress(bytes) if bytes.len() == 32 => {
-					let addr: [u8; 16] = bytes[..16].try_into().unwrap();
-					let mask: [u8; 16] = bytes[16..].try_into().unwrap();
-					Self::IpAddress(CidrSubnet::V6(addr, mask))
-				},
-				_ => continue,
-			};
-			result.push(subtree);
-		}
-
-		Ok(result)
-	}
-
-	fn tag(&self) -> u64 {
-		// Defined in the GeneralName list in
-		// https://tools.ietf.org/html/rfc5280#page-38
-		const TAG_RFC822_NAME: u64 = 1;
-		const TAG_DNS_NAME: u64 = 2;
-		const TAG_DIRECTORY_NAME: u64 = 4;
-		const TAG_IP_ADDRESS: u64 = 7;
-
-		match self {
-			GeneralSubtree::Rfc822Name(_name) => TAG_RFC822_NAME,
-			GeneralSubtree::DnsName(_name) => TAG_DNS_NAME,
-			GeneralSubtree::DirectoryName(_name) => TAG_DIRECTORY_NAME,
-			GeneralSubtree::IpAddress(_addr) => TAG_IP_ADDRESS,
-		}
-	}
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[allow(missing_docs)]
-/// CIDR subnet, as per [RFC 4632](https://tools.ietf.org/html/rfc4632)
-///
-/// You might know CIDR subnets better by their textual representation
-/// where they consist of an ip address followed by a slash and a prefix
-/// number, for example `192.168.99.0/24`.
-///
-/// The first field in the enum is the address, the second is the mask.
-/// Both are specified in network byte order.
-pub enum CidrSubnet {
-	V4([u8; 4], [u8; 4]),
-	V6([u8; 16], [u8; 16]),
-}
-
-macro_rules! mask {
-	($t:ty, $d:expr) => {{
-		let v = <$t>::MAX;
-		let v = v.checked_shr($d as u32).unwrap_or(0);
-		(!v).to_be_bytes()
-	}};
-}
-
-impl CidrSubnet {
-	/// Obtains the CidrSubnet from an ip address
-	/// as well as the specified prefix number.
-	///
-	/// ```
-	/// # use std::net::IpAddr;
-	/// # use std::str::FromStr;
-	/// # use rcgen::CidrSubnet;
-	/// // The "192.0.2.0/24" example from
-	/// // https://tools.ietf.org/html/rfc5280#page-42
-	/// let addr = IpAddr::from_str("192.0.2.0").unwrap();
-	/// let subnet = CidrSubnet::from_addr_prefix(addr, 24);
-	/// assert_eq!(subnet, CidrSubnet::V4([0xC0, 0x00, 0x02, 0x00], [0xFF, 0xFF, 0xFF, 0x00]));
-	/// ```
-	pub fn from_addr_prefix(addr: IpAddr, prefix: u8) -> Self {
-		match addr {
-			IpAddr::V4(addr) => Self::from_v4_prefix(addr.octets(), prefix),
-			IpAddr::V6(addr) => Self::from_v6_prefix(addr.octets(), prefix),
-		}
-	}
-	/// Obtains the CidrSubnet from an IPv4 address in network byte order
-	/// as well as the specified prefix.
-	pub fn from_v4_prefix(addr: [u8; 4], prefix: u8) -> Self {
-		CidrSubnet::V4(addr, mask!(u32, prefix))
-	}
-	/// Obtains the CidrSubnet from an IPv6 address in network byte order
-	/// as well as the specified prefix.
-	pub fn from_v6_prefix(addr: [u8; 16], prefix: u8) -> Self {
-		CidrSubnet::V6(addr, mask!(u128, prefix))
-	}
-	fn to_bytes(self) -> Vec<u8> {
-		let mut res = Vec::new();
-		match self {
-			CidrSubnet::V4(addr, mask) => {
-				res.extend_from_slice(&addr);
-				res.extend_from_slice(&mask);
-			},
-			CidrSubnet::V6(addr, mask) => {
-				res.extend_from_slice(&addr);
-				res.extend_from_slice(&mask);
-			},
-		}
-		res
-	}
-}
-
-/// Obtains the CidrSubnet from the well-known
-/// addr/prefix notation.
-/// ```
-/// # use std::str::FromStr;
-/// # use rcgen::CidrSubnet;
-/// // The "192.0.2.0/24" example from
-/// // https://tools.ietf.org/html/rfc5280#page-42
-/// let subnet = CidrSubnet::from_str("192.0.2.0/24").unwrap();
-/// assert_eq!(subnet, CidrSubnet::V4([0xC0, 0x00, 0x02, 0x00], [0xFF, 0xFF, 0xFF, 0x00]));
-/// ```
-impl FromStr for CidrSubnet {
-	type Err = ();
-
-	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		let mut iter = s.split('/');
-		if let (Some(addr_s), Some(prefix_s)) = (iter.next(), iter.next()) {
-			let addr = IpAddr::from_str(addr_s).map_err(|_| ())?;
-			let prefix = u8::from_str(prefix_s).map_err(|_| ())?;
-			Ok(Self::from_addr_prefix(addr, prefix))
-		} else {
-			Err(())
-		}
-	}
-}
-
 /// Helper to obtain an `OffsetDateTime` from year, month, day values
 ///
 /// The year, month, day values are assumed to be in UTC.
@@ -1046,67 +516,6 @@ pub fn date_time_ymd(year: i32, month: u8, day: u8) -> OffsetDateTime {
 	primitive_dt.assume_utc()
 }
 
-/// Whether the certificate is allowed to sign other certificates
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum IsCa {
-	/// The certificate can only sign itself
-	NoCa,
-	/// The certificate can only sign itself, adding the extension and `CA:FALSE`
-	ExplicitNoCa,
-	/// The certificate may be used to sign other certificates
-	Ca(BasicConstraints),
-}
-
-impl IsCa {
-	#[cfg(all(test, feature = "x509-parser"))]
-	fn from_x509(x509: &x509_parser::certificate::X509Certificate<'_>) -> Result<Self, Error> {
-		let basic_constraints = x509
-			.basic_constraints()
-			.map_err(|_| Error::CouldNotParseCertificate)?
-			.map(|ext| ext.value);
-
-		match basic_constraints {
-			Some(bc) => Self::from_basic_constraints(bc),
-			None => Ok(Self::NoCa),
-		}
-	}
-
-	#[cfg(feature = "x509-parser")]
-	pub(crate) fn from_basic_constraints(
-		basic_constraints: &x509_parser::extensions::BasicConstraints,
-	) -> Result<Self, Error> {
-		use x509_parser::extensions::BasicConstraints as B;
-
-		Ok(match basic_constraints {
-			B {
-				ca: true,
-				path_len_constraint: Some(n),
-			} if *n <= u8::MAX as u32 => Self::Ca(BasicConstraints::Constrained(*n as u8)),
-			B {
-				ca: true,
-				path_len_constraint: Some(_),
-			} => return Err(Error::CouldNotParseCertificate),
-			B {
-				ca: true,
-				path_len_constraint: None,
-			} => Self::Ca(BasicConstraints::Unconstrained),
-			B { ca: false, .. } => Self::ExplicitNoCa,
-		})
-	}
-}
-
-/// The path length constraint (only relevant for CA certificates)
-///
-/// Sets an optional upper limit on the length of the intermediate certificate chain
-/// length allowed for this CA certificate (not including the end entity certificate).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BasicConstraints {
-	/// No constraint
-	Unconstrained,
-	/// Constrain to the contained number of intermediate certificates
-	Constrained(u8),
-}
-
 #[cfg(test)]
 mod tests {
 	#[cfg(feature = "x509-parser")]
@@ -1121,8 +530,134 @@ mod tests {
 	use super::*;
 	#[cfg(feature = "x509-parser")]
 	use crate::DnValue;
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	use crate::GeneralSubtree;
 	#[cfg(feature = "crypto")]
-	use crate::KeyPair;
+	use crate::{KeyPair, PathLenConstraint};
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn subject_extension_presence_matches_in_certificates_and_csrs() {
+		use x509_parser::extensions::ParsedExtension;
+		use x509_parser::prelude::FromDer;
+
+		let (key, _) = KeyPair::generate().unwrap();
+		for include_ku in [false, true] {
+			for include_eku in [false, true] {
+				let mut params = CertificateParams::new(vec!["example.com".into()]).unwrap();
+				if include_ku {
+					params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+				}
+				if include_eku {
+					params
+						.extended_key_usages
+						.push(ExtendedKeyUsagePurpose::ServerAuth);
+				}
+				let cert = params.self_signed(&key).unwrap();
+				let (_, parsed) = x509_parser::parse_x509_certificate(cert.der()).unwrap();
+				assert_eq!(parsed.key_usage().unwrap().is_some(), include_ku);
+				assert_eq!(parsed.extended_key_usage().unwrap().is_some(), include_eku);
+				assert!(parsed.subject_alternative_name().unwrap().is_some());
+
+				let csr = params.serialize_request(&key).unwrap();
+				let (_, parsed) =
+					x509_parser::certification_request::X509CertificationRequest::from_der(
+						csr.der(),
+					)
+					.unwrap();
+				let extensions: Vec<_> = parsed.requested_extensions().unwrap().collect();
+				// No malformed empty extension may hide behind a different parsed variant.
+				assert_eq!(
+					extensions.len(),
+					1 + usize::from(include_ku) + usize::from(include_eku)
+				);
+				assert_eq!(
+					extensions
+						.iter()
+						.any(|ext| matches!(ext, ParsedExtension::KeyUsage(_))),
+					include_ku
+				);
+				assert_eq!(
+					extensions
+						.iter()
+						.any(|ext| matches!(ext, ParsedExtension::ExtendedKeyUsage(_))),
+					include_eku
+				);
+				assert!(extensions
+					.iter()
+					.any(|ext| matches!(ext, ParsedExtension::SubjectAlternativeName(_))));
+			}
+		}
+	}
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn name_constraints_preserve_each_nonempty_subtree_list() {
+		let (key, _) = KeyPair::generate().unwrap();
+		for include_permitted in [false, true] {
+			for include_excluded in [false, true] {
+				let permitted = if include_permitted {
+					vec![GeneralSubtree::DnsName("example.com".into())]
+				} else {
+					Vec::new()
+				};
+				let excluded = if include_excluded {
+					vec![GeneralSubtree::DnsName("blocked.example.com".into())]
+				} else {
+					Vec::new()
+				};
+				let constraints = if include_permitted || include_excluded {
+					Some(NameConstraints::new(permitted, excluded).unwrap())
+				} else {
+					None
+				};
+				let params = CertificateParams {
+					basic_constraints: Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained)),
+					name_constraints: constraints,
+					..CertificateParams::default()
+				};
+				let cert = params.self_signed(&key).unwrap();
+				let (_, parsed) = x509_parser::parse_x509_certificate(cert.der()).unwrap();
+				let constraints = parsed.name_constraints().unwrap();
+				if !include_permitted && !include_excluded {
+					assert!(constraints.is_none());
+					continue;
+				}
+				let constraints = constraints.unwrap().value;
+				assert_eq!(
+					constraints.permitted_subtrees.as_ref().map(Vec::len),
+					include_permitted.then_some(1)
+				);
+				assert_eq!(
+					constraints.excluded_subtrees.as_ref().map(Vec::len),
+					include_excluded.then_some(1)
+				);
+			}
+		}
+	}
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn basic_constraints_absent_for_no_ca() {
+		let params = CertificateParams::default();
+		let (key, _) = KeyPair::generate().unwrap();
+		let cert = params.self_signed(&key).unwrap();
+		let (_, parsed) = x509_parser::parse_x509_certificate(cert.der()).unwrap();
+		assert!(parsed.basic_constraints().unwrap().is_none());
+		let csr = params.serialize_request(&key).unwrap();
+		use x509_parser::prelude::FromDer;
+		let (_, parsed) =
+			x509_parser::certification_request::X509CertificationRequest::from_der(csr.der())
+				.unwrap();
+		assert!(parsed
+			.requested_extensions()
+			.into_iter()
+			.flatten()
+			.all(|ext| !matches!(
+				ext,
+				x509_parser::extensions::ParsedExtension::BasicConstraints(_)
+			)));
+	}
 
 	#[cfg(feature = "crypto")]
 	#[test]
@@ -1135,12 +670,12 @@ mod tests {
 				KeyUsagePurpose::ContentCommitment,
 			],
 			// This can sign things!
-			is_ca: IsCa::Ca(BasicConstraints::Constrained(0)),
+			basic_constraints: Some(BasicConstraints::Ca(PathLenConstraint::Constrained(0))),
 			..CertificateParams::default()
 		};
 
 		// Make the cert
-		let key_pair = KeyPair::generate().unwrap();
+		let (key_pair, _) = KeyPair::generate().unwrap();
 		let cert = params.self_signed(&key_pair).unwrap();
 
 		// Parse it
@@ -1173,12 +708,12 @@ mod tests {
 	#[test]
 	fn test_explicit_no_ca() {
 		let params = CertificateParams {
-			is_ca: IsCa::ExplicitNoCa,
+			basic_constraints: Some(BasicConstraints::EndEntity),
 			..CertificateParams::default()
 		};
 
 		// Make the cert
-		let key_pair = KeyPair::generate().unwrap();
+		let (key_pair, _) = KeyPair::generate().unwrap();
 		let cert = params.self_signed(&key_pair).unwrap();
 
 		// Parse it
@@ -1205,20 +740,24 @@ mod tests {
 
 	#[cfg(feature = "crypto")]
 	#[test]
-	fn test_empty_crl_distribution_point_uris_rejected() {
-		let params = CertificateParams {
-			crl_distribution_points: vec![CrlDistributionPoint { uris: Vec::new() }],
-			..CertificateParams::default()
-		};
+	fn test_end_entity_subject_key_identifier() {
+		// RFC 5280 §4.2.1.2 describes the SKI as a SHOULD for end entity
+		// certificates, so we expect it to be present for end entity certs too.
+		let params = CertificateParams::default();
+		let (key_pair, _) = KeyPair::generate().unwrap();
+		let cert = params.self_signed(&key_pair).unwrap();
 
-		// A distribution point with no URIs would be encoded as an empty
-		// fullName, violating GeneralNames ::= SEQUENCE SIZE (1..MAX) OF
-		// GeneralName (RFC 5280 §4.2.1.13), so it must be rejected.
-		let key_pair = KeyPair::generate().unwrap();
-		assert_eq!(
-			params.self_signed(&key_pair).unwrap_err(),
-			Error::EmptyCrlDistributionPointUris
-		);
+		let (_rem, cert) = x509_parser::parse_x509_certificate(cert.der()).unwrap();
+		let ski = cert
+			.iter_extensions()
+			.find_map(|ext| match ext.parsed_extension() {
+				x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(ski) => {
+					Some(ski.0.to_vec())
+				},
+				_ => None,
+			})
+			.unwrap();
+		assert_eq!(ski, params.key_identifier(&key_pair));
 	}
 
 	#[cfg(feature = "crypto")]
@@ -1234,7 +773,7 @@ mod tests {
 			..CertificateParams::default()
 		};
 
-		let key_pair = KeyPair::generate().unwrap();
+		let (key_pair, _) = KeyPair::generate().unwrap();
 		let cert = params.self_signed(&key_pair).unwrap();
 
 		let (_rem, cert) = x509_parser::parse_x509_certificate(cert.der()).unwrap();
@@ -1247,13 +786,14 @@ mod tests {
 		// The CRL distribution points extension must be present even when it
 		// is the only extension requested by the params.
 		let params = CertificateParams {
-			crl_distribution_points: vec![CrlDistributionPoint {
-				uris: vec!["http://crl.example.com".to_string()],
-			}],
+			crl_distribution_points: vec![CrlDistributionPoint::new(vec![
+				"http://crl.example.com".into(),
+			])
+			.unwrap()],
 			..CertificateParams::default()
 		};
 
-		let key_pair = KeyPair::generate().unwrap();
+		let (key_pair, _) = KeyPair::generate().unwrap();
 		let cert = params.self_signed(&key_pair).unwrap();
 
 		let (_rem, cert) = x509_parser::parse_x509_certificate(cert.der()).unwrap();
@@ -1270,12 +810,12 @@ mod tests {
 			// Set key usages
 			key_usages: vec![KeyUsagePurpose::DecipherOnly],
 			// This can sign things!
-			is_ca: IsCa::Ca(BasicConstraints::Constrained(0)),
+			basic_constraints: Some(BasicConstraints::Ca(PathLenConstraint::Constrained(0))),
 			..CertificateParams::default()
 		};
 
 		// Make the cert
-		let key_pair = KeyPair::generate().unwrap();
+		let (key_pair, _) = KeyPair::generate().unwrap();
 		let cert = params.self_signed(&key_pair).unwrap();
 
 		// Parse it
@@ -1310,7 +850,7 @@ mod tests {
 		};
 
 		// Make the cert
-		let key_pair = KeyPair::generate().unwrap();
+		let (key_pair, _) = KeyPair::generate().unwrap();
 		let cert = params.self_signed(&key_pair).unwrap();
 
 		// Parse it
@@ -1338,7 +878,7 @@ mod tests {
 		};
 
 		// Make the cert
-		let key_pair = KeyPair::generate().unwrap();
+		let (key_pair, _) = KeyPair::generate().unwrap();
 		let cert = params.self_signed(&key_pair).unwrap();
 
 		// Parse it
@@ -1359,7 +899,7 @@ mod tests {
 		#[test]
 		#[cfg(windows)]
 		fn test_windows_line_endings() {
-			let key_pair = KeyPair::generate().unwrap();
+			let (key_pair, _) = KeyPair::generate().unwrap();
 			let cert = CertificateParams::default().self_signed(&key_pair).unwrap();
 			assert!(cert.pem().contains("\r\n"));
 		}
@@ -1367,7 +907,7 @@ mod tests {
 		#[test]
 		#[cfg(not(windows))]
 		fn test_not_windows_line_endings() {
-			let key_pair = KeyPair::generate().unwrap();
+			let (key_pair, _) = KeyPair::generate().unwrap();
 			let cert = CertificateParams::default().self_signed(&key_pair).unwrap();
 			assert!(!cert.pem().contains('\r'));
 		}
@@ -1378,9 +918,9 @@ mod tests {
 	fn parse_other_name_alt_name() {
 		// Create and serialize a certificate with an alternative name containing an "OtherName".
 		let mut params = CertificateParams::default();
-		let other_name = SanType::OtherName((vec![1, 2, 3, 4], "Foo".into()));
+		let other_name = GeneralName::OtherName((vec![1, 2, 3, 4], "Foo".into()));
 		params.subject_alt_names.push(other_name.clone());
-		let key_pair = KeyPair::generate().unwrap();
+		let (key_pair, _) = KeyPair::generate().unwrap();
 		let cert = params.self_signed(&key_pair).unwrap();
 
 		// We should be able to parse the certificate with x509-parser.
@@ -1410,7 +950,7 @@ mod tests {
 			email_address_dn_type.clone(),
 			email_address_dn_value.clone(),
 		);
-		let key_pair = KeyPair::generate().unwrap();
+		let (key_pair, _) = KeyPair::generate().unwrap();
 		let cert = params.self_signed(&key_pair).unwrap();
 
 		// We should be able to parse the certificate with x509-parser.
@@ -1432,16 +972,16 @@ mod tests {
 	#[test]
 	fn converts_from_ip() {
 		let ip = Ipv4Addr::new(2, 4, 6, 8);
-		let ip_san = SanType::IpAddress(IpAddr::V4(ip));
+		let ip_san = GeneralName::IpAddress(IpAddr::V4(ip));
 
 		let mut params = CertificateParams::new(vec!["crabs".to_owned()]).unwrap();
-		let ca_key = KeyPair::generate().unwrap();
+		let (ca_key, _) = KeyPair::generate().unwrap();
 
 		// Add the SAN we want to test the parsing for
 		params.subject_alt_names.push(ip_san.clone());
 
 		// Because we're using a function for CA certificates
-		params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+		params.basic_constraints = Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained));
 
 		// Serialize our cert that has our chosen san, so we can testing parsing/deserializing it.
 		let cert = params.self_signed(&ca_key).unwrap();
@@ -1567,7 +1107,7 @@ PITGdT9dgN88nHPCle0B1+OY+OZ5
 					.unwrap()
 			);
 
-			let ee_key = KeyPair::generate().unwrap();
+			let (ee_key, _) = KeyPair::generate().unwrap();
 			let ee_params = CertificateParams {
 				use_authority_key_identifier_extension: true,
 				..CertificateParams::default()

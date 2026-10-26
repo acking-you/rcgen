@@ -1,7 +1,7 @@
 use rcgen::DnValue::PrintableString;
 use rcgen::{
-	BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
-	Issuer, KeyPair, KeyUsagePurpose,
+	BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, Issuer,
+	KeyPair, KeyUsagePurpose, PathLenConstraint,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -21,7 +21,7 @@ fn new_ca() -> (Certificate, Issuer<'static, KeyPair>) {
 	let mut params =
 		CertificateParams::new(Vec::default()).expect("empty subject alt name can't produce error");
 	let (yesterday, tomorrow) = validity_period();
-	params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+	params.basic_constraints = Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained));
 	params.distinguished_name.push(
 		DnType::CountryName,
 		PrintableString("BR".try_into().unwrap()),
@@ -36,7 +36,7 @@ fn new_ca() -> (Certificate, Issuer<'static, KeyPair>) {
 	params.not_before = yesterday;
 	params.not_after = tomorrow;
 
-	let key_pair = KeyPair::generate().unwrap();
+	let (key_pair, _) = KeyPair::generate().unwrap();
 	let cert = params.self_signed(&key_pair).unwrap();
 	(cert, Issuer::new(params, key_pair))
 }
@@ -54,7 +54,7 @@ fn new_end_entity(issuer: &Issuer<'static, KeyPair>) -> Certificate {
 	params.not_before = yesterday;
 	params.not_after = tomorrow;
 
-	let key_pair = KeyPair::generate().unwrap();
+	let (key_pair, _) = KeyPair::generate().unwrap();
 	params.signed_by(&key_pair, issuer).unwrap()
 }
 

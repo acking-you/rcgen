@@ -45,8 +45,12 @@ pub enum Error {
 	InvalidCrlNextUpdate,
 	/// CRL issuer specifies Key Usages that don't include cRLSign.
 	IssuerNotCrlSigner,
+	/// Name constraints must contain at least one permitted or excluded subtree.
+	EmptyNameConstraints,
 	/// A CRL distribution point was specified without any URIs.
 	EmptyCrlDistributionPointUris,
+	/// Two extensions have the same OID.
+	DuplicateExtension(String),
 	#[cfg(not(feature = "crypto"))]
 	/// Missing serial number
 	MissingSerialNumber,
@@ -99,8 +103,14 @@ impl fmt::Display for Error {
 				f,
 				"CRL issuer must specify no key usage, or key usage including cRLSign"
 			)?,
+			EmptyNameConstraints => {
+				write!(f, "Name constraints must include at least one subtree")?
+			},
 			EmptyCrlDistributionPointUris => {
 				write!(f, "CRL distribution points must include at least one URI")?
+			},
+			DuplicateExtension(oid) => {
+				write!(f, "Extensions must have unique OIDs (duplicate {oid})")?
 			},
 			#[cfg(not(feature = "crypto"))]
 			MissingSerialNumber => write!(f, "A serial number must be specified")?,
