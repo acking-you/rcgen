@@ -48,7 +48,7 @@ jobs:
             # `fips` and `aws_lc_rs_unstable` cannot be used together, so avoid `--all-features`
             - run: cargo clippy --features ring,pem,x509-parser --all-targets
             # rustls-cert-gen require either aws_lc_rs or ring feature
-            - run: cargo clippy -p rcgen --no-default-features --all-targets
+            - run: cargo clippy -p rcgen-plus --no-default-features --all-targets
             - run: cargo clippy --no-default-features --features ring --all-targets
             - run: cargo clippy --no-default-features --features aws_lc_rs,pem,x509-parser --all-targets
             - run: cargo clippy --no-default-features --features aws_lc_rs_unstable,pem,x509-parser --all-targets
@@ -159,7 +159,7 @@ jobs:
               run: cargo test --no-default-features --features aws_lc_rs,pem
               # rustls-cert-gen require either aws_lc_rs or ring feature
             - name: Run the tests with no features enabled
-              run: cargo test -p rcgen --no-default-features
+              run: cargo test -p rcgen-plus --no-default-features
 
     build:
         strategy:

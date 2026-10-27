@@ -8,7 +8,7 @@ edition = "2021"
 rust-version = "1.88"
 readme = "README.md"
 description = "Rust X.509 certificate generator"
-repository = "https://github.com/rustls/rcgen"
+repository = "https://github.com/acking-you/rcgen"
 keywords = ["mkcert", "ca", "certificate"]
 
 [workspace.dependencies]

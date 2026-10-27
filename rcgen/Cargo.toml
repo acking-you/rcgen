@@ -1,14 +1,18 @@
 [package]
-name = "rcgen"
+name = "rcgen-plus"
 version = "0.15.0"
-documentation = "https://docs.rs/rcgen"
-description.workspace = true
+documentation = "https://docs.rs/rcgen-plus"
+description = "Rust X.509 certificate generator (the fork pb-mapper pins, published as rcgen-plus)"
 repository.workspace = true
 readme.workspace = true
 license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 keywords.workspace = true
+
+[lib]
+# Published as rcgen-plus; code keeps importing it as `rcgen`.
+name = "rcgen"
 
 [features]
 default = ["crypto", "pem", "ring"]

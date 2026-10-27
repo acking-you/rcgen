@@ -812,7 +812,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
-name = "rcgen"
+name = "rcgen-plus"
 version = "0.15.0"
 dependencies = [
  "aws-lc-rs",
@@ -905,7 +905,7 @@ dependencies = [
  "aws-lc-rs",
  "bpaf",
  "pem",
- "rcgen",
+ "rcgen-plus",
  "ring",
  "rustls-pki-types",
  "x509-parser",
@@ -1133,7 +1133,7 @@ dependencies = [
  "botan",
  "openssl",
  "pem",
- "rcgen",
+ "rcgen-plus",
  "ring",
  "rustls-pki-types",
  "rustls-webpki",
